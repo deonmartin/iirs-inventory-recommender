@@ -1,0 +1,23 @@
+-- Fabricated sample data. Matches sample-data/mock-erp-data.csv
+
+INSERT INTO materials (material, description, material_type, material_group, plant, family, mgd2, upc) VALUES ('A-100234-17', 'Alpha Trail Lantern 400', 'FERT', 'A', '1000', 'LANTERNS', 'CATEGORY A US', '012345600001') ON CONFLICT DO NOTHING;
+INSERT INTO materials (material, description, material_type, material_group, plant, family, mgd2, upc) VALUES ('A-100235-17', 'Alpha Trail Lantern 400 Kit', 'FERT', 'A', '1000', 'LANTERNS', 'CATEGORY A US', '012345600002') ON CONFLICT DO NOTHING;
+INSERT INTO materials (material, description, material_type, material_group, plant, family, mgd2, upc) VALUES ('A-2200XY-0', 'Alpha Camp Stove 2B', 'FERT', 'B', '1000', 'STOVES', 'CATEGORY B US', '012345600003') ON CONFLICT DO NOTHING;
+INSERT INTO materials (material, description, material_type, material_group, plant, family, mgd2, upc) VALUES ('A-3AB65201', 'Alpha Cooler 45', 'FERT', 'C', '1000', 'COOLERS', 'CATEGORY C US', '012345600004') ON CONFLICT DO NOTHING;
+INSERT INTO materials (material, description, material_type, material_group, plant, family, mgd2, upc) VALUES ('111-2222-33', 'Alpha Lantern Mantle Pack', 'FERT', 'A', '1000', 'ACCESSORIES', 'CATEGORY A US', '012345600005') ON CONFLICT DO NOTHING;
+INSERT INTO materials (material, description, material_type, material_group, plant, family, mgd2, upc) VALUES ('912345678', 'Alpha Stove Fuel Canister 8oz', 'FERT', 'B', '1000', 'ACCESSORIES', 'CATEGORY B US', '012345600006') ON CONFLICT DO NOTHING;
+INSERT INTO materials (material, description, material_type, material_group, plant, family, mgd2, upc) VALUES ('BR22B4', 'Bravo Daypack 22L', 'FERT', 'B', '1000', 'PACKS', 'CATEGORY B US', '012345600007') ON CONFLICT DO NOTHING;
+INSERT INTO materials (material, description, material_type, material_group, plant, family, mgd2, upc) VALUES ('BR22MB6', 'Bravo Daypack 22L Moss', 'FERT', 'B', '1000', 'PACKS', 'CATEGORY B US', '012345600008') ON CONFLICT DO NOTHING;
+INSERT INTO materials (material, description, material_type, material_group, plant, family, mgd2, upc) VALUES ('BX1218CH', 'Bravo Hydration Bladder 3L', 'FERT', 'B', '1000', 'PACKS', 'CATEGORY B US', '012345600009') ON CONFLICT DO NOTHING;
+INSERT INTO materials (material, description, material_type, material_group, plant, family, mgd2, upc) VALUES ('CH22L1811', 'Charlie Insulated Bottle 32oz', 'FERT', 'C', '1000', 'DRINKWARE', 'CATEGORY C US', '012345600010') ON CONFLICT DO NOTHING;
+INSERT INTO materials (material, description, material_type, material_group, plant, family, mgd2, upc) VALUES ('CH22W2111', 'Charlie Insulated Bottle 40oz', 'FERT', 'C', '1000', 'DRINKWARE', 'CATEGORY C US', '012345600011') ON CONFLICT DO NOTHING;
+INSERT INTO materials (material, description, material_type, material_group, plant, family, mgd2, upc) VALUES ('N771234567', 'Alpha Camp Chair Classic', 'FERT', 'A', '1000', 'CHAIRS', 'CATEGORY A US', '012345600012') ON CONFLICT DO NOTHING;
+INSERT INTO materials (material, description, material_type, material_group, plant, family, mgd2, upc) VALUES ('A-100199-17', 'Alpha Trail Lantern 300', 'FERT', 'A', '1000', 'DISCONTINUED', 'CATEGORY A US', '012345600013') ON CONFLICT DO NOTHING;
+INSERT INTO materials (material, description, material_type, material_group, plant, family, mgd2, upc) VALUES ('A-3AB77002', 'Alpha Cooler 65', 'FERT', 'C', '1000', 'COOLERS', 'CATEGORY C US', '012345600014') ON CONFLICT DO NOTHING;
+INSERT INTO materials (material, description, material_type, material_group, plant, family, mgd2, upc) VALUES ('BR22CH4', 'Bravo Daypack 22L Charcoal', 'FERT', 'B', '1000', 'PACKS', 'CATEGORY B US', '012345600015') ON CONFLICT DO NOTHING;
+INSERT INTO materials (material, description, material_type, material_group, plant, family, mgd2, upc) VALUES ('222-0001-00', 'Alpha Lantern Carry Case', 'FERT', 'A', '1000', 'ACCESSORIES', 'CATEGORY A US', '012345600016') ON CONFLICT DO NOTHING;
+INSERT INTO materials (material, description, material_type, material_group, plant, family, mgd2, upc) VALUES ('CH22L2022', 'Charlie Insulated Bottle 20oz', 'FERT', 'C', '1000', 'DRINKWARE', 'CATEGORY C US', '012345600017') ON CONFLICT DO NOTHING;
+
+-- Customer 1000001 has a profile. Customer 1000002 (used by the sample file) has none and gets defaults.
+INSERT INTO iirs_customer_profiles (customer_id, customer_name, customer_group, order_frequency, ordering_horizon_days, target_weeks_on_hand, case_pack_preference, preferred_brands, excluded_categories, min_recommended_qty)
+VALUES ('1000001', 'Example Dealer', 'Dealer Group', 'Quarterly', 60, 12, 'Both', ARRAY['Alpha','Bravo','Charlie'], ARRAY['Accessories'], 1) ON CONFLICT DO NOTHING;

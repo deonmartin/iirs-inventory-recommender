@@ -1,0 +1,686 @@
+{
+  "name": "STAGE 2 - SAC Data Retrieval",
+  "nodes": [
+    {
+      "parameters": {
+        "jsCode": "const data = $input.all()[0].json.value || [];\nif (data.length === 0) throw new Error('Stage 2 FATAL: Customer not found in SAC for ID: ' + $('Code in JavaScript').item.json.customerId);\n\nconst c = data[0];\nreturn [{\n  json: {\n    customer: {\n      customerId:     c.CUSTOMER,\n      customerName:   c.CUSTOMERNAME || c.ORGANIZATIONBPNAME1 || null,\n      customerName2:  c.ORGANIZATIONBPNAME2 || null,\n      street:         c.STREETNAME || null,\n      city:           c.CITYNAME || null,\n      region:         c.REGION || null,\n      postalCode:     c.POSTALCODE || null,\n      country:        c.COUNTRY || null,\n      accountGroup:   c.CUSTOMERACCOUNTGROUP || null,\n      classification: c.CUSTOMERCLASSIFICATION || null\n    }\n  }\n}];"
+      },
+      "id": "c2df5f4f-fa8b-4f85-ad85-b81ee5864b03",
+      "name": "Unpack Customer",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -176,
+        96
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const raw = $('When Executed by Another Workflow').first().json;\nconst stage1Raw = raw.items ? raw : (raw.stage1Data ? JSON.parse(raw.stage1Data) : null);\nconst stage1 = stage1Raw && stage1Raw.items ? stage1Raw : {\n  items: [],\n  _meta: {},\n  envelope: {}\n};\nconst customer    = $('Unpack Customer').first().json.customer;\nconst openOrders  = $('Unpack_to_OpenOrders').all().map(i => i.json);\nconst salesHist   = $('Unpack_To_History Orders').all().map(i => i.json);\nconst atsMap      = $('Unpack ATS').first().json.atsMap;\nconst matList     = $('Get Material Master').all().map(i => i.json);\nconst netSellRows = $('Unpack net Sell ALL').all().map(i => i.json);\n\n// Build net sell pricing lookup — independent of ATS status\nconst netSellMap = {};\nfor (const p of netSellRows) {\n  if (p.material) {\n    netSellMap[p.material] = {\n      netSellPrice: p.netSellPrice,\n      currency: p.currency || 'USD'\n    };\n  }\n}\n\n// Build lookups\nconst openOrderMap = {};\nfor (const o of openOrders) {\n  const mat = o.Material;\n  if (!mat) continue;\n  if (!openOrderMap[mat]) {\n    openOrderMap[mat] = {\n      material: mat,\n      totalOpenQty: 0,\n      earliestDelivery: null\n    };\n  }\n  openOrderMap[mat].totalOpenQty += o.OpenQty || 0;\n  if (o.RequestedDeliveryDate) {\n    if (!openOrderMap[mat].earliestDelivery || o.RequestedDeliveryDate < openOrderMap[mat].earliestDelivery) {\n      openOrderMap[mat].earliestDelivery = o.RequestedDeliveryDate;\n    }\n  }\n}\n\nconst matMap = {};\nconst upcMap = {};\nfor (const m of matList) {\n  if (m.MATERIAL) {\n    matMap[m.MATERIAL] = { family: m.FAMILY, mgd2: m.MGD2, description: m.DESCRIPTION };\n    if (m.UPC) upcMap[m.MATERIAL] = m.UPC;\n  }\n}\n\nconst salesHistMap = {};\nfor (const s of salesHist) {\n  const mat = s.Material;\n  if (!mat) continue;\n  if (!salesHistMap[mat]) {\n    salesHistMap[mat] = {\n      material: mat,\n      totalShippedQty: 0,\n      totalNetAmount: 0,\n      orderCount: 0\n    };\n  }\n  salesHistMap[mat].totalShippedQty += s.ShippedQty || 0;\n  salesHistMap[mat].totalNetAmount  += s.NetAmount || 0;\n  salesHistMap[mat].orderCount      += 1;\n}\n\n// Enrich each customer item with SAC data\n// Discontinued items are filtered out here to reduce downstream token costs\nconst enrichedItems = stage1.items\n  .map(item => {\n    const mat = item.mfrItemNumber;\n    const ats = mat && atsMap[mat] ? atsMap[mat].ats : null;\n    const oo  = mat ? openOrderMap[mat] : null;\n    const sh  = mat ? salesHistMap[mat] : null;\n    const mm  = mat ? matMap[mat] : null;\n    const np  = mat ? netSellMap[mat] : null;\n    const sacUpc      = upcMap[mat] ?? '';\n    const customerUpc = item.upc ?? '';\n    return {\n      ...item,\n      sacData: {\n        qtyAvailableToSell:  ats,\n        netSellPrice:        np ? np.netSellPrice : (mat && atsMap[mat] ? atsMap[mat].netSellPrice || 0 : 0),\n        currency:            np ? np.currency : (mat && atsMap[mat] ? atsMap[mat].currency || 'USD' : 'USD'),\n        openOrderQty:        oo ? oo.totalOpenQty : 0,\n        earliestDelivery:    oo ? oo.earliestDelivery : null,\n        totalShippedQty:     sh ? sh.totalShippedQty : 0,\n        totalNetAmount:      sh ? sh.totalNetAmount : 0,\n        orderCount:          sh ? sh.orderCount : 0,\n        hasOpenOrder:        oo !== null && oo !== undefined,\n        family:              mm ? mm.family : null,\n        mgd2:                mm ? mm.mgd2 : null,\n        upc:                 sacUpc,\n        upcMismatch:         customerUpc && sacUpc && customerUpc !== sacUpc ? true : false\n      }\n    };\n  })\n  .filter(item => {\n    // Remove discontinued items — they consume tokens at every stage\n    // with no recommendation value. Filter after enrichment so we have\n    // family/MGD2 data from SAC to make the determination.\n    const family = (item.sacData?.family ?? '').toUpperCase();\n    const mgd2   = (item.sacData?.mgd2   ?? '').toUpperCase();\n    return family !== 'DISCONTINUED' && mgd2 !== 'DISCONTINUED';\n  });\n\n// Find items customer doesn't carry but Acme has in stock\nconst customerMaterials = new Set(\n  enrichedItems\n    .filter(i => i.mfrItemNumber)\n    .map(i => i.mfrItemNumber)\n);\n\nconst opportunityItems = Object.values(atsMap)\n  .filter(q => {\n    if (q.ats <= 0 || customerMaterials.has(q.material)) return false;\n    // Also exclude discontinued opportunity items\n    const mm = matMap[q.material];\n    if (!mm) return true;\n    const family = (mm.family ?? '').toUpperCase();\n    const mgd2   = (mm.mgd2   ?? '').toUpperCase();\n    return family !== 'DISCONTINUED' && mgd2 !== 'DISCONTINUED';\n  })\n  .map(q => {\n    const oo = openOrderMap[q.material] ?? null;\n    const np = netSellMap[q.material] ?? null;\n    return {\n      material:         q.material,\n      ats:              q.ats,\n      netSellPrice:     np ? np.netSellPrice : (q.netSellPrice || 0),\n      currency:         np ? np.currency : (q.currency || 'USD'),\n      salesData:        salesHistMap[q.material] || null,\n      openOrderQty:     oo ? oo.totalOpenQty : 0,\n      earliestDelivery: oo ? oo.earliestDelivery : null,\n      hasOpenOrder:     oo !== null,\n      upc:              upcMap[q.material] ?? ''\n    };\n  });\n\nconst workingObject = {\n  ...stage1,\n  customer,\n  items: enrichedItems,\n  openOrders,\n  availability:    Object.values(atsMap),\n  topItems:        [],\n  salesHistory:    salesHist,\n  opportunityItems,\n  _meta: {\n    ...stage1._meta,\n    stage2CompletedAt: new Date().toISOString(),\n    openOrderCount:    openOrders.length,\n    salesHistoryCount: salesHist.length,\n    availabilityCount: Object.keys(atsMap).length,\n    opportunityCount:  opportunityItems.length\n  }\n};\n\nreturn [{ json: workingObject }];"
+      },
+      "id": "25448a12-c807-4228-8eb6-0cd8443de392",
+      "name": "Build Stage 2 Working Object",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        272,
+        576
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://your-tenant.authentication.region.hana.ondemand.com/oauth/token",
+        "sendBody": true,
+        "contentType": "form-urlencoded",
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "grant_type",
+              "value": "client_credentials"
+            },
+            {
+              "name": "client_id",
+              "value": "YOUR_CLIENT_ID"
+            },
+            {
+              "name": "client_secret",
+              "value": "YOUR_CLIENT_SECRET"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.3,
+      "position": [
+        -624,
+        672
+      ],
+      "id": "7d7bd775-2bad-4ddc-b543-74c599800e47",
+      "name": "Get SAC Token"
+    },
+    {
+      "parameters": {
+        "inputSource": "passthrough"
+      },
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        -1072,
+        672
+      ],
+      "id": "b54cae38-4dae-4918-9ecc-6ee73976c69f",
+      "name": "When Executed by Another Workflow"
+    },
+    {
+      "parameters": {
+        "jsCode": "const input = $input.all();\n\nconst customerId = $input.all()[0].json.customerId ?? $input.all()[0].json.envelope?.customerId ?? null;\nif (!customerId) throw new Error('Stage 2 FATAL: No customer ID received from Stage 1');\n\nconst d = new Date();\nd.setFullYear(d.getFullYear() - 1);\nconst twelveMonthsAgo = d.toISOString().split('T')[0];\n\nconsole.log('RAW INPUT:', JSON.stringify(input));\n\nreturn [{ json: { customerId, twelveMonthsAgo } }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -848,
+        672
+      ],
+      "id": "5d48561d-6bad-4a2a-8c3d-24575b80f9d0",
+      "name": "Code in JavaScript"
+    },
+    {
+      "parameters": {
+        "url": "https://your-tenant.region.analytics.cloud.sap/api/v1/dataexport/providers/sac/PROVIDER_ID_OPEN_ORDERS/FactData",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "$filter",
+              "value": "=SOLDTOPARTY eq '{{$('Code in JavaScript').item.json.customerId}}'"
+            }
+          ]
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "={{ 'Bearer ' + $('Get SAC Token').item.json.access_token }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            },
+            {
+              "name": "Accept",
+              "value": "application/json"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 60000
+        }
+      },
+      "id": "7a3dc0c0-3848-47e8-b9ce-fcda6ef90354",
+      "name": "Open Orders",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        -400,
+        384
+      ]
+    },
+    {
+      "parameters": {
+        "url": "https://your-tenant.region.analytics.cloud.sap/api/v1/dataexport/providers/sac/PROVIDER_ID_CUSTOMER_INFO/FactData",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "$top",
+              "value": "1"
+            },
+            {
+              "name": "$filter",
+              "value": "=CUSTOMER eq '{{$('Code in JavaScript').item.json.customerId}}'"
+            }
+          ]
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "={{ 'Bearer ' + $('Get SAC Token').item.json.access_token }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            },
+            {
+              "name": "Accept",
+              "value": "application/json"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 60000
+        }
+      },
+      "id": "ab962f95-b295-4751-9836-94fb9900dd79",
+      "name": "Customer Info",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        -400,
+        96
+      ]
+    },
+    {
+      "parameters": {
+        "workflowId": {
+          "__rl": true,
+          "value": "REPLACE_WITH_WORKFLOW_ID",
+          "mode": "id"
+        },
+        "workflowInputs": {
+          "mappingMode": "defineBelow",
+          "value": {},
+          "matchingColumns": [],
+          "schema": [],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": true
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.3,
+      "position": [
+        -400,
+        672
+      ],
+      "id": "338f2bfb-cc84-4b97-b6d4-9a9665192093",
+      "name": "Call 'ATS For IIRS'"
+    },
+    {
+      "parameters": {
+        "jsCode": "const records = $input.all()[0].json.value || [];\nconst allowedGroups = ['10', '11', '12', '15'];\nconst twelveMonthsAgo = new Date();\ntwelveMonthsAgo.setFullYear(twelveMonthsAgo.getFullYear() - 1);\nconst cutoffDate = twelveMonthsAgo.toISOString().split('T')[0];\nconst rows = [];\nfor (const r of records) {\n  const customerGroup = r.CUSTOMERGROUP || r.CustomerGroup || null;\n  if (!allowedGroups.includes(String(customerGroup))) continue;\n  const deliveryStatus = r.DELIVERYSTATUS || r.DeliveryStatus || null;\n  if (deliveryStatus !== 'B' && deliveryStatus !== 'C') continue;\n  const orderDate = r.SALESORDERDATE || r.SalesOrderDate || null;\nif (orderDate && orderDate < cutoffDate) continue;\n  const requestedQty = r.REQUESTEDQUANTITY || r.RequestedQuantity || 0;\n  const confirmedQty = r.CONFDDELIVQTYINORDERQTYUNIT || r.ConfdDelivQtyInOrderQtyUnit || 0;\n  const remainingQty = requestedQty - confirmedQty;\n rows.push({\n    SoldToParty:           r.SOLDTOPARTY || r.SoldToParty || null,\n    Material:              r.MATERIAL || r.Material || null,\n    SalesOrderDate:        r.SALESORDERDATE || r.SalesOrderDate || null,\n    RequestedDeliveryDate: r.REQUESTEDDELIVERYDATE || r.RequestedDeliveryDate || null,\n    DeliveryStatus:        deliveryStatus,\n    RequestedQty:          requestedQty,\n    ShippedQty:            confirmedQty,\n    RemainingQty:          remainingQty,\n    NetAmount:             r.NETAMOUNT || r.NetAmount || 0   // ← add this\n});\n}\nreturn rows.map(r => ({ json: r }));"
+      },
+      "id": "971499c5-d9e1-47e3-8fd9-027ca85fa5ce",
+      "name": "Unpack_To_History Orders",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -176,
+        480
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const records = $input.all()[0].json.value || [];\nconst allowedGroups = ['10', '11', '12', '15'];\nconst rows = [];\nfor (const r of records) {\n  const customerGroup = r.CUSTOMERGROUP || r.CustomerGroup || null;\n  if (!allowedGroups.includes(String(customerGroup))) continue;\n  const deliveryStatus = r.DELIVERYSTATUS || r.DeliveryStatus || null;\n  if (deliveryStatus === 'C') continue;\n  const requestedQty = r.REQUESTEDQUANTITY || r.RequestedQuantity || 0;\n  const confirmedQty = r.CONFDDELIVQTYINORDERQTYUNIT || r.ConfdDelivQtyInOrderQtyUnit || 0;\n  const openQty = requestedQty - confirmedQty;\n  rows.push({\n    SoldToParty: r.SOLDTOPARTY || r.SoldToParty || null,\n    Material: r.MATERIAL || r.Material || null,\n    SalesOrderDate: r.SALESORDERDATE || r.SalesOrderDate || null,\n    RequestedDeliveryDate: r.REQUESTEDDELIVERYDATE || r.RequestedDeliveryDate || null,\n    OpenQty: openQty\n  });\n}\nreturn rows.map(r => ({ json: r }));"
+      },
+      "id": "9af4c579-fa4b-4e6b-95af-c74e614bd68b",
+      "name": "Unpack_to_OpenOrders",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -176,
+        288
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const items = $input.all();\nconst atsMap = {};\nfor (const item of items) {\n  const r = item.json;\n  const mat = r.MATERIAL || r.material || null;\n  if (!mat) continue;\n  atsMap[mat] = {\n    material: mat,\n    ats: r.ATS || 0,\n    netSellPrice: r.netSellPrice || 0,\n    currency: r.currency || 'USD',\n    description: r.DESCRIPTION || r.description || '',\n    family: (r.FAMILY || r.family || '').trim(),\n    mgd2: (r.MGD2 || r.mgd2 || '').trim()\n  };\n}\nreturn [{ json: { atsMap } }];"
+      },
+      "id": "59e058ac-8076-4b28-80cf-98a16bb76c9c",
+      "name": "Unpack ATS",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -176,
+        672
+      ]
+    },
+    {
+      "parameters": {
+        "numberInputs": 6
+      },
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3.2,
+      "position": [
+        48,
+        512
+      ],
+      "id": "e8105490-84d4-490b-8c2e-2dab758a1150",
+      "name": "Merge"
+    },
+    {
+      "parameters": {
+        "jsCode": "const materials = $input.all()[0].json.value;\n\nreturn materials\n  .filter(item => item.MaterialType !== 'ROH')  // ← add this line\n  .map(item => ({\n    json: {\n      MATERIAL:       item.Material,\n      DESCRIPTION:    item.Material_Description_.trim(),\n      MATERIAL_TYPE:  item.MaterialType,\n      MATERIAL_GROUP: item.MaterialGroup,\n      PLANT:          item.Plant,\n      FAMILY:         (item.Family || '').trim(),\n      MGD2:           (item.MGD2   || '').trim()\n    }\n  }));"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -848,
+        1280
+      ],
+      "id": "71d41367-be69-4ea7-af76-75479a8476eb",
+      "name": "Unpack for MAT_LST"
+    },
+    {
+      "parameters": {
+        "url": "https://your-tenant.region.analytics.cloud.sap/api/v1/dataexport/providers/sac/PROVIDER_ID_GET_MATERIAL_LIST/FactData",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "$top",
+              "value": "20000"
+            }
+          ]
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{$node[\"Get SAC Token\"].json[\"access_token\"]}}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            },
+            {
+              "name": "Accept",
+              "value": "application/json"
+            }
+          ]
+        },
+        "options": {
+          "batching": {
+            "batch": {
+              "batchSize": 5000
+            }
+          }
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.3,
+      "position": [
+        -1072,
+        1280
+      ],
+      "id": "b8de8171-d3b2-411e-bd31-be6eb9d5e074",
+      "name": "Get Material List"
+    },
+    {
+      "parameters": {
+        "url": "https://your-tenant.region.analytics.cloud.sap/api/v1/dataexport/providers/sac/PROVIDER_ID_GET_MATERIAL_UPC/MaterialMaster",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "$top",
+              "value": "20000"
+            }
+          ]
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{$node[\"Get SAC Token\"].json[\"access_token\"]}}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            },
+            {
+              "name": "Accept",
+              "value": "application/json"
+            }
+          ]
+        },
+        "options": {
+          "batching": {
+            "batch": {
+              "batchSize": 5000
+            }
+          }
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.3,
+      "position": [
+        -1072,
+        1504
+      ],
+      "id": "02f220a7-c390-4193-9f1a-59f26cb5726b",
+      "name": "Get Material UPC"
+    },
+    {
+      "parameters": {
+        "jsCode": "const rows = $input.all()[0].json.value;\n\nconst upcMap = {};\nfor (const row of rows) {\n  if (row.ID) upcMap[row.ID] = row.UPC ?? '';\n}\n\nreturn [{ json: { upcMap } }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -848,
+        1504
+      ],
+      "id": "fb00e840-5045-4f75-ba7e-4fb2461eb044",
+      "name": "Unpack for UPC"
+    },
+    {
+      "parameters": {
+        "url": "https://your-tenant.region.analytics.cloud.sap/api/v1/dataexport/providers/sac/PROVIDER_ID_GET_NET_SELL_ALL/FactData",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "$top",
+              "value": "50000"
+            },
+            {
+              "name": "$filter",
+              "value": "=CUSTOMERPRICEGROUP eq 'STANDARD' and CONDITIONVALIDITYSTARTDATE le '{{ $now.format('yyyy-MM-dd') }}' and CONDITIONVALIDITYENDDATE ge '{{ $now.format('yyyy-MM-dd') }}'"
+            }
+          ]
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{$node[\"Get SAC Token\"].json[\"access_token\"]}}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            },
+            {
+              "name": "Accept",
+              "value": "application/json"
+            }
+          ]
+        },
+        "options": {
+          "batching": {
+            "batch": {
+              "batchSize": 5000
+            }
+          }
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.3,
+      "position": [
+        -400,
+        1056
+      ],
+      "id": "748ecee5-4f5a-43b1-8443-d7ec488a7654",
+      "name": "Get Net Sell ALL"
+    },
+    {
+      "parameters": {
+        "jsCode": "const items = $input.all()[0].json.value;\n\nconst pricingMap = {};\nitems.forEach(item => {\n  if (item.MATERIAL && item.CONDITIONRATEVALUE) {\n    pricingMap[item.MATERIAL] = {\n      material: item.MATERIAL,\n      netSellPrice: item.CONDITIONRATEVALUE,\n      currency: item.CONDITIONRATEVALUEUNIT\n    };\n  }\n});\n\nreturn Object.values(pricingMap).map(p => ({ json: p }));"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -176,
+        1056
+      ],
+      "id": "109261b6-5b0b-4251-bd0b-9471761ee141",
+      "name": "Unpack net Sell ALL"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT material AS \"MATERIAL\", description AS \"DESCRIPTION\", material_type AS \"MATERIAL_TYPE\", material_group AS \"MATERIAL_GROUP\", plant AS \"PLANT\", family AS \"FAMILY\", mgd2 AS \"MGD2\", upc AS \"UPC\" FROM materials WHERE material_type != 'ROH'",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        -176,
+        864
+      ],
+      "id": "f66abaf2-3bd9-4db4-9ec5-ccd82ec92336",
+      "name": "Get Material Master",
+      "credentials": {
+        "postgres": {
+          "id": "REPLACE_ME",
+          "name": "Postgres account"
+        }
+      }
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Unpack Customer": {
+      "main": [
+        [
+          {
+            "node": "Merge",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Stage 2 Working Object": {
+      "main": [
+        []
+      ]
+    },
+    "Get SAC Token": {
+      "main": [
+        [
+          {
+            "node": "Call 'ATS For IIRS'",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Customer Info",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Open Orders",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Get Material Master",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Get Net Sell ALL",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "When Executed by Another Workflow": {
+      "main": [
+        [
+          {
+            "node": "Code in JavaScript",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code in JavaScript": {
+      "main": [
+        [
+          {
+            "node": "Get SAC Token",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Open Orders": {
+      "main": [
+        [
+          {
+            "node": "Unpack_to_OpenOrders",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Unpack_To_History Orders",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Customer Info": {
+      "main": [
+        [
+          {
+            "node": "Unpack Customer",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Call 'ATS For IIRS'": {
+      "main": [
+        [
+          {
+            "node": "Unpack ATS",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Unpack_to_OpenOrders": {
+      "main": [
+        [
+          {
+            "node": "Merge",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Unpack_To_History Orders": {
+      "main": [
+        [
+          {
+            "node": "Merge",
+            "type": "main",
+            "index": 2
+          }
+        ]
+      ]
+    },
+    "Unpack ATS": {
+      "main": [
+        [
+          {
+            "node": "Merge",
+            "type": "main",
+            "index": 3
+          }
+        ]
+      ]
+    },
+    "Merge": {
+      "main": [
+        [
+          {
+            "node": "Build Stage 2 Working Object",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Material List": {
+      "main": [
+        [
+          {
+            "node": "Unpack for MAT_LST",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Unpack for MAT_LST": {
+      "main": [
+        []
+      ]
+    },
+    "Get Material UPC": {
+      "main": [
+        [
+          {
+            "node": "Unpack for UPC",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Unpack for UPC": {
+      "main": [
+        []
+      ]
+    },
+    "Get Net Sell ALL": {
+      "main": [
+        [
+          {
+            "node": "Unpack net Sell ALL",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Unpack net Sell ALL": {
+      "main": [
+        [
+          {
+            "node": "Merge",
+            "type": "main",
+            "index": 5
+          }
+        ]
+      ]
+    },
+    "Get Material Master": {
+      "main": [
+        [
+          {
+            "node": "Merge",
+            "type": "main",
+            "index": 4
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  },
+  "meta": {
+    "templateCredsSetupCompleted": false
+  },
+  "tags": []
+}

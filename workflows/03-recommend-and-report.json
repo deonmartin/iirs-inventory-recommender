@@ -1,0 +1,450 @@
+{
+  "name": "STAGE 3 - Recommendation Engine",
+  "nodes": [
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://your-tenant.authentication.region.hana.ondemand.com/oauth/token",
+        "sendBody": true,
+        "contentType": "form-urlencoded",
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "grant_type",
+              "value": "client_credentials"
+            },
+            {
+              "name": "client_id",
+              "value": "YOUR_CLIENT_ID"
+            },
+            {
+              "name": "client_secret",
+              "value": "YOUR_CLIENT_SECRET"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "id": "caf07ae7-3356-4d75-a010-f3692aea987a",
+      "name": "Get SAC Token",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1168,
+        768
+      ],
+      "notes": "Copy client_id and client_secret from Stage 2 Get SAC Token node. Do not hardcode credentials — move to N8N credentials store before go-live."
+    },
+    {
+      "parameters": {
+        "url": "https://your-tenant.region.analytics.cloud.sap/api/v1/dataexport/providers/sac/PROVIDER_ID_GET_TOP_SELLERS/FactData",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "$filter",
+              "value": "=BILLINGDOCUMENTDATE ge '{{ $now.minus({months: 12}).toFormat('yyyyMMdd') }}' and BILLINGDOCUMENTDATE le '{{ $now.toFormat('yyyyMMdd') }}'"
+            }
+          ]
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $('Get SAC Token').item.json.access_token }}"
+            },
+            {
+              "name": "Accept",
+              "value": "application/json"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 300000
+        }
+      },
+      "id": "71834f95-2765-4e3b-92f3-567fcd7f6e55",
+      "name": "Get Top Sellers",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1392,
+        576
+      ],
+      "notes": "Company-wide sales history — no customer filter. Same endpoint as Stage 2 sales history pull. If >5000 records exist, increase $top or add pagination."
+    },
+    {
+      "parameters": {
+        "jsCode": "const raw = $input.item.json?.value ?? [];\nconst records = Array.isArray(raw) ? raw : [];\n\nconst matMap = {};\nfor (let i = 0; i < records.length; i++) {\n  const r = records[i];\n  const mat = r.MATERIAL ?? '';\n  const qty = parseFloat(r.CONFDDELIVQTYINORDERQTYUNIT ?? 0);\n  if (!mat) continue;\n  if (!matMap[mat]) {\n    matMap[mat] = { MATERIAL: mat, totalShipped: 0 };\n  }\n  matMap[mat].totalShipped += qty;\n}\n\nconst output = Object.values(matMap);\nreturn output.map(function(item) { return { json: item }; });"
+      },
+      "id": "093afe81-a7a9-4112-bae9-ac2bd28dbc88",
+      "name": "Unpack Top Sellers",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1616,
+        576
+      ],
+      "notes": "Aggregates raw SAC records by material+sub-family, ranks top 10 per sub-family by total units shipped company-wide. Merges result back into the Stage 1 working object."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.anthropic.com/v1/messages",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "anthropic-version",
+              "value": "2023-06-01"
+            },
+            {
+              "name": "content-type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"model\": \"claude-sonnet-4-6\",\n  \"max_tokens\": 32000,\n  \"stream\": false,\n  \"system\": {{ JSON.stringify($json.recommenderSystemPrompt) }},\n  \"messages\": {{ JSON.stringify($json.recommenderMessages) }}\n}",
+        "options": {
+          "timeout": 600000
+        }
+      },
+      "id": "a04a1a93-c941-4865-bb4d-cde2abf88ce0",
+      "name": "Call Claude API (Recommender)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2512,
+        768
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE_ME",
+          "name": "LLM API Header Auth"
+        }
+      },
+      "notes": "Uses same Header Auth credential as Stage 1 Claude parser (ID: Heb7OHVfd1A6t1OX). Switch to credential selector in N8N UI — replace x-api-key header value with the credential reference. Model: claude-sonnet-4-6. For testing switch to claude-haiku-4-5-20251001 to save cost."
+    },
+    {
+      "parameters": {},
+      "id": "2b3ff63b-cfc7-4d1b-a1b4-0e338ecffcd3",
+      "name": "Stage 3 Complete — Output",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        3184,
+        768
+      ],
+      "notes": "Stage 3 return point. Stage 1 Execute Workflow node reads output from here. Returns: aiNarrative (string), recommendedOrder[] (array), plus full enriched working object from Stage 1/2."
+    },
+    {
+      "parameters": {
+        "mode": "combine",
+        "fieldsToMatchString": "MATERIAL",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3.2,
+      "position": [
+        1840,
+        672
+      ],
+      "id": "792ba4a2-14aa-42e9-a010-05e8aaaa0722",
+      "name": "Merge"
+    },
+    {
+      "parameters": {
+        "inputSource": "passthrough"
+      },
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        944,
+        768
+      ],
+      "id": "6d52afe1-a01a-42fe-b0cd-e4c7ec183268",
+      "name": "Stage 3 Trigger"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT customer_id, customer_name, ordering_horizon_days, target_weeks_on_hand,\norder_frequency, preferred_brands, excluded_categories, customer_group,\ncase_pack_preference, seasonal_notes, special_notes, notes\nFROM iirs_customer_profiles\nWHERE customer_id = '{{ $('Stage 3 Trigger').item.json.envelope.customerId }}'\nLIMIT 1;",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        1840,
+        944
+      ],
+      "id": "17338289-9df4-4006-a48e-3f92d517dae7",
+      "name": "Get Customer Profile",
+      "alwaysOutputData": true,
+      "credentials": {
+        "postgres": {
+          "id": "REPLACE_ME",
+          "name": "Postgres account"
+        }
+      },
+      "notes": "Reads ordering profile for this customer from iirs_customer_profiles table. Returns empty if no profile exists — Build Recommender Prompt falls back to defaults (30-day horizon, 4 weeks on hand, as-needed)."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO iirs_customer_profiles (\n  customer_id,\n  customer_name,\n  customer_group,\n  order_frequency,\n  ordering_horizon_days,\n  target_weeks_on_hand,\n  case_pack_preference,\n  preferred_brands,\n  excluded_categories,\n  seasonal_notes\n) VALUES (\n  '1000001',\n  'Example Dealer',\n  'Dealer Group',\n  'Quarterly',\n  60,\n  12,\n  'Both',\n  ARRAY['Alpha', 'Bravo', 'Charlie'],\n  ARRAY['Accessories'],\n  NULL\n);",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        944,
+        1168
+      ],
+      "id": "5354f460-a7e5-46cd-b93f-7024b41799da",
+      "name": "SETUP — Create Profile Table (run once then disable)",
+      "credentials": {
+        "postgres": {
+          "id": "REPLACE_ME",
+          "name": "Postgres account"
+        }
+      },
+      "notes": "Run once to create the table, then disable this node. Not connected to any flow — execute manually via right-click > Execute Node."
+    },
+    {
+      "parameters": {
+        "mode": "chooseBranch"
+      },
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3.2,
+      "position": [
+        2064,
+        768
+      ],
+      "id": "74285558-9914-4014-a659-3dd86c64d8b6",
+      "name": "Merge1"
+    },
+    {
+      "parameters": {
+        "jsCode": "const workingObj = $('Stage 3 Trigger').item.json;\nconst customer         = workingObj.customer ?? {};\nconst items            = workingObj.items ?? [];\nconst salesHistory     = workingObj.salesHistory ?? [];\nconst openOrders       = workingObj.openOrders ?? [];\nconst opportunityItems = workingObj.opportunityItems ?? [];\n\n// ── BLOCKLIST — SKUs never available for new orders ───────────────────────\nconst BLOCKLISTED_SKUS = [\n  'A-100234-XX',\n  'A-100235-XX'\n];\n\n// ── CUSTOMER PROFILE ──────────────────────────────────────────────────────\nlet profile = null;\ntry {\n  const profileRows = $('Get Customer Profile').all();\n  if (profileRows.length > 0 && profileRows[0].json && profileRows[0].json.customer_id) {\n    profile = profileRows[0].json;\n  }\n} catch(e) { profile = null; }\n\nconst hasProfile = profile !== null;\n\n// ── TOP SELLERS + MATERIAL LOOKUP ─────────────────────────────────────────\n// These are global context — computed once from the full merged item list,\n// unaffected by chunking, and included identically in every chunk's prompt.\nconst mergedItems = $input.all();\nconst matLookup = {};\nconst topSellersBySubFamily = {};\n\nfor (let i = 0; i < mergedItems.length; i++) {\n  const row     = mergedItems[i].json;\n  const mat     = row.MATERIAL    ?? '';\n  const family  = (row.FAMILY ?? 'UNKNOWN').trim();\n  const mgd2    = (row.MGD2   ?? '').trim();\n  const desc    = row.DESCRIPTION ?? '';\n  const shipped = row.totalShipped ?? 0;\n\n  if (mat) matLookup[mat] = { family, mgd2, description: desc };\n\n  if (!topSellersBySubFamily[family]) topSellersBySubFamily[family] = [];\n  topSellersBySubFamily[family].push({ material: mat, description: desc, mgd2, totalShipped: shipped });\n}\n\nfor (const family of Object.keys(topSellersBySubFamily)) {\n  topSellersBySubFamily[family] = topSellersBySubFamily[family]\n    .sort((a, b) => b.totalShipped - a.totalShipped)\n    .slice(0, 5)\n    .map((item, idx) => ({\n      rank: idx + 1,\n      material: item.material,\n      description: item.description,\n      mgd2: item.mgd2,\n      totalShipped: item.totalShipped\n    }));\n}\n\n// ── ITEM SUMMARY (filtered) ───────────────────────────────────────────────\nconst itemSummary = items\n  .filter(i => {\n    const family  = ((i.sacData?.family) ?? '').trim().toUpperCase();\n    const mgd2    = ((i.sacData?.mgd2)   ?? '').trim().toUpperCase();\n    const ats     = i.sacData?.qtyAvailableToSell;\n    const price   = i.sacData?.netSellPrice   ?? 0;\n    const shipped = i.sacData?.totalShippedQty ?? 0;\n    const openOrd = i.sacData?.openOrderQty    ?? 0;\n    const qoh     = i.qtyOnHand ?? 0;\n    const mat     = i.mfrItemNumber ?? i.itemNo ?? i.material ?? '';\n\n    if (BLOCKLISTED_SKUS.includes(mat)) return false;\n    if (family === 'DISCONTINUED' || mgd2 === 'DISCONTINUED') return false;\n    if (ats === null && price === 0 && shipped === 0 && openOrd === 0 && qoh === 0) return false;\n    if ((ats ?? 0) > 0 && (ats ?? 0) < 10) return false;\n\n    return true;\n  })\n  .map(i => {\n    const mat    = i.mfrItemNumber ?? i.itemNo ?? i.material ?? '';\n    const lookup = matLookup[mat] ?? {};\n    return {\n      itemNo:           mat,\n      upc:              i.sacData?.upc              ?? '',\n      description:      i.description ?? lookup.description ?? '',\n      family:           (i.sacData?.family)           ?? lookup.family ?? '',\n      mgd2:             (i.sacData?.mgd2)             ?? lookup.mgd2   ?? '',\n      customerQOH:      i.qtyOnHand                   ?? 0,\n      acmeATS:           i.sacData?.qtyAvailableToSell  ?? 0,\n      netSellPrice:     i.sacData?.netSellPrice         ?? 0,\n      openOrderQty:     i.sacData?.openOrderQty         ?? 0,\n      totalShipped12mo: i.sacData?.totalShippedQty      ?? 0,\n      hasOpenOrder:     i.sacData?.hasOpenOrder         ?? false\n    };\n  });\n\n// ── LOW VOLUME DETECTION ──────────────────────────────────────────────────\n// Computed against the FULL itemSummary before chunking, so slicing later\n// doesn't skew this classification for any individual chunk.\nconst totalVelocity = itemSummary.reduce((sum, i) => {\n  const soldThrough = Math.max(0, i.totalShipped12mo - i.customerQOH);\n  return sum + (soldThrough / 52);\n}, 0);\nconst avgWeeklyVelocity = itemSummary.length > 0 ? totalVelocity / itemSummary.length : 0;\nconst isLowVolume = !hasProfile && avgWeeklyVelocity < 0.5;\n\n// ── PROFILE VALUES — with low-volume fallback ─────────────────────────────\nconst orderingHorizonDays  = profile?.ordering_horizon_days  ?? 63;\nconst targetWeeksOnHand    = profile?.target_weeks_on_hand   ?? (isLowVolume ? 15 : 9);\nconst orderFrequency       = profile?.order_frequency        ?? 'as-needed';\nconst preferredBrands      = profile?.preferred_brands       ?? null;\nconst excludedCategories   = profile?.excluded_categories    ?? null;\nconst customerGroup        = profile?.customer_group         ?? null;\nconst casePackPreference   = profile?.case_pack_preference   ?? 'both';\nconst notes                = profile?.notes                  ?? null;\nconst seasonalNotes        = profile?.seasonal_notes         ?? null;\nconst specialNotes         = profile?.special_notes          ?? null;\nconst minRecommendedQty    = profile?.min_recommended_qty    ?? 1;\n\n// ── HISTORY BY SUB-FAMILY ─────────────────────────────────────────────────\n// Global context — computed once, included identically in every chunk.\nconst historyBySubFamily = {};\nfor (const h of salesHistory) {\n  const mat    = h.Material ?? h.MATERIAL ?? '';\n  const lookup = matLookup[mat] ?? {};\n  const sf     = lookup.family ?? h.FAMILY ?? 'UNKNOWN';\n  if (!historyBySubFamily[sf]) historyBySubFamily[sf] = { totalQty: 0, totalAmount: 0 };\n  const qty = parseFloat(h.ShippedQty ?? h.QUANT_BUN ?? 0);\n  const amt = parseFloat(h.NetAmount  ?? h.netAmount ?? 0);\n  historyBySubFamily[sf].totalQty    += qty;\n  historyBySubFamily[sf].totalAmount += amt;\n}\n\n// ── OPEN ORDER SUMMARY ────────────────────────────────────────────────────\n// Global context — computed once, included identically in every chunk.\nconst openOrderSubFamilies = [];\nfor (const o of openOrders) {\n  const mat = o.Material ?? o.MATERIAL ?? '';\n  const sf  = (matLookup[mat] ?? {}).family ?? 'UNKNOWN';\n  if (!openOrderSubFamilies.includes(sf)) openOrderSubFamilies.push(sf);\n}\nconst openOrderSummary = { totalLines: openOrders.length, subFamilies: openOrderSubFamilies };\n\n// ── OPPORTUNITY ITEMS ─────────────────────────────────────────────────────\n// Already capped at 30 and small — global context, included identically in\n// every chunk rather than being split.\nconst opptySummary = opportunityItems\n  .slice().sort((a, b) => (b.ats ?? 0) - (a.ats ?? 0))\n  .filter(o => {\n    const mat = o.material ?? o.MATERIAL ?? '';\n    if (BLOCKLISTED_SKUS.includes(mat)) return false;\n    if ((o.ats ?? 0) < 10) return false;\n    return true;\n  })\n  .slice(0, 30)\n  .map(o => {\n    const mat    = o.material ?? o.MATERIAL ?? '';\n    const lookup = matLookup[mat] ?? {};\n    return {\n      itemNo:       mat,\n      upc:          o.upc          ?? '',\n      description:  o.description ?? o.DESCRIPTION ?? lookup.description ?? '',\n      family:       o.family ?? lookup.family ?? '',\n      mgd2:         o.mgd2   ?? lookup.mgd2   ?? '',\n      acmeATS:       o.ats    ?? o.ATS    ?? 0,\n      netSellPrice: o.netSellPrice ?? 0,\n      openOrderQty: o.openOrderQty ?? 0,\n      hasOpenOrder: o.hasOpenOrder ?? false\n    };\n  });\n\n// ── CHUNKING (only for genuinely large item summaries) ─────────────────────\n// Mirrors the Stage 1 Build AI Parser Prompt pattern. Unlike Stage 1, the\n// motivation isn't output-token overflow from itemSummary size alone — it's\n// that raising the recommendation LIMIT on a single call (20/15 -> 40/30)\n// blew the output cap. Splitting itemSummary into chunks lets each chunk\n// independently propose up to the same proven-safe 20/15 limit from its own\n// subset, so the total candidate pool grows across chunks without any\n// single call's output growing past what's already known to fit safely.\n// Accounts at or under CHUNK_THRESHOLD items are unaffected — they still\n// produce exactly one chunk, one API call, identical to current behavior.\nconst CHUNK_THRESHOLD = 250;\nconst CHUNK_SIZE = 150;\n\nconst itemChunks = [];\nif (itemSummary.length > CHUNK_THRESHOLD) {\n  for (let i = 0; i < itemSummary.length; i += CHUNK_SIZE) {\n    itemChunks.push(itemSummary.slice(i, i + CHUNK_SIZE));\n  }\n} else {\n  itemChunks.push(itemSummary);\n}\nconst totalChunks = itemChunks.length;\n\n// ── SYSTEM PROMPT (shared across all chunks) ────────────────────────────────\nconst weeksLabel = targetWeeksOnHand >= 8\n  ? `${targetWeeksOnHand} weeks (${Math.round(targetWeeksOnHand / 4.33)} months)`\n  : `${targetWeeksOnHand} weeks`;\n\nconst casePackRule =\n  casePackPreference === 'case-pack-only'\n    ? 'This customer orders in case packs only — recommendedQty must be an exact multiple of casePack. Never recommend less than one full case pack.'\n    : casePackPreference === 'less-than-case-pack-only'\n    ? 'This customer orders in less-than-case-pack quantities only — recommendedQty should never be a full case pack multiple. Recommend individual units as needed.'\n    : 'Recommend the exact quantity needed based on velocity and target stock level. Do not round to case pack multiples. Single units or any whole number quantity is acceptable.';\n\nconst profileLines = [\n  `- Customer group: ${customerGroup ?? 'unknown'}`,\n  `- Order frequency: ${orderFrequency}`,\n  `- Ordering horizon: ${orderingHorizonDays} days — size recommendations to cover this window`,\n  `- Target stock level: ${weeksLabel} on hand`,\n  `- Case pack preference: ${casePackPreference}`,\n  `- Minimum recommended quantity per SKU: ${minRecommendedQty} units — never recommend fewer than this regardless of velocity calculation`,\n  `- Customer volume classification: ${isLowVolume ? 'LOW VOLUME — this is a small independent dealer with thin purchase history. Recommendations should be conservative and focused on top opportunity items. Note this in the narrative.' : 'standard'}`,\n];\nif (preferredBrands)    profileLines.push(`- Preferred brands: ${preferredBrands}`);\nif (excludedCategories) profileLines.push(`- Excluded categories / products: ${excludedCategories}`);\nif (seasonalNotes)      profileLines.push(`- Seasonal patterns: ${seasonalNotes}`);\nif (specialNotes)       profileLines.push(`- Special notes: ${specialNotes}`);\nif (notes)              profileLines.push(`- Additional notes: ${notes}`);\n\nconst systemPrompt = [\n  \"You are an expert wholesale sales analyst for Acme Manufacturing.\",\n  \"You analyze customer inventory submissions and purchase history to generate intelligent reorder recommendations.\",\n  \"\",\n  \"OUTPUT FORMAT — THIS IS THE MOST CRITICAL INSTRUCTION:\",\n  \"Your ENTIRE response must be a single valid JSON object and absolutely nothing else.\",\n  \"Do NOT use markdown. Do NOT use asterisks (*). Do NOT use bullet points (- or •). Do NOT use numbered lists.\",\n  \"Do NOT show calculations, working notes, reasoning steps, or any explanatory text anywhere in your response.\",\n  \"Do NOT include any text before the opening { or after the closing }.\",\n  \"Do NOT put any text between the availableNow array and the futureAvailability array.\",\n  \"A single character outside the JSON structure will break the system. The response must start with { and end with } and contain nothing else.\",\n  \"\",\n  \"CRITICAL FIELD DEFINITIONS — read carefully before analyzing any data:\",\n  \"- customerQOH: the quantity the CUSTOMER currently has on their shelves, taken directly from their inventory submission. This is their stock, not ours.\",\n  \"- acmeATS: Acme's Available-to-Sell quantity — our warehouse stock available for immediate shipment. This is our stock, not theirs.\",\n  \"- totalShipped12mo: total units Acme has shipped to this customer over the past 12 months (velocity indicator — never use directly as a target).\",\n  \"- openOrderQty: quantity already on open or partially shipped sales orders for this SKU — already in the pipeline, counts as inventory the customer will have.\",\n  \"These four fields are DIFFERENT numbers. Never substitute one for another in your rationale or narrative.\",\n  \"\",\n  \"Your output must be a single valid JSON object with exactly three keys:\",\n  \"1. availableNow - array of order lines for items where acmeATS > 0 (Available for Immediate Delivery)\",\n  \"2. futureAvailability - array of order lines for items where acmeATS <= 0 (Future Availability)\",\n  \"3. narrative - a professional sales rep briefing (plain text, 100-150 words), OR an empty string if instructed below. No markdown, no asterisks, no bullet points — plain sentences only. Never use the double-quote character (\\\") anywhere — use '' (two single quotes) for inch measurements.\",\n  \"\",\n  \"IMPORTANT: Write availableNow first, then futureAvailability, then narrative. This ensures recommendations are never truncated.\",\n  \"\",\n  \"Each order line object in BOTH arrays must have exactly these keys with exactly these value types:\",\n  '{ \"itemNo\": \"string\", \"upc\": \"string\", \"description\": \"string\", \"brand\": \"string\", \"subFamily\": \"string\", \"mgd2\": \"string\", \"casePack\": number, \"recommendedQty\": number, \"netSellPrice\": number, \"rationale\": \"string\" }',\n  \"\",\n  \"Field rules:\",\n  \"- itemNo: Acme item number — use the exact itemNo from the submitted inventory data (string, never blank)\",\n  \"- upc: UPC code — use the exact upc value from the submitted inventory item data (string, use empty string if not available)\",\n  \"- description: product description — use '' (two single quotes) for inch measurements, never the double-quote character (\\\")\",\n  \"- brand: one of Alpha, Bravo, or Charlie (string)\",\n  \"- subFamily: FAMILY value (string)\",\n  \"- mgd2: MGD2 value (string)\",\n  \"- casePack: 5 for large items, 10 for all others (number — no quotes)\",\n  \"- recommendedQty: positive whole number greater than 0 (number — no quotes)\",\n  \"- netSellPrice: use the netSellPrice from the submitted data if available, else 0 (number — no quotes)\",\n  \"- rationale: one sentence — must reference customerQOH when describing customer stock level — use '' for inch measurements, never the double-quote character (\\\")\",\n  \"\",\n  \"CUSTOMER ORDERING PROFILE:\",\n  ...profileLines,\n  \"\",\n  \"Recommendation rules:\",\n  \"- CRITICAL: Every item you include must be a genuine actionable recommendation. Omit any SKU you determine should be excluded — do not include it with a rationale explaining why it is excluded.\",\n  \"- availableNow: include SKUs where acmeATS >= 10 that need replenishment. LIMIT to 20 items maximum, prioritized by sell-through velocity.\",\n  \"- futureAvailability: include SKUs where acmeATS <= 0 that the customer carries or should carry. LIMIT to 15 items maximum, prioritized by purchase history.\",\n  \"\",\n  `- MANDATORY PRE-SCREENING — run this exact decision tree on EVERY SKU before including it:`,\n  `  Step 1: soldThrough = max(0, totalShipped12mo - customerQOH)`,\n  `  Step 2: weeklyVelocity = soldThrough / 52`,\n  `  Step 3: effectiveCoverage = (customerQOH + openOrderQty) / weeklyVelocity`,\n  `     — if weeklyVelocity = 0, effectiveCoverage = 999 (skip unless opportunity item not currently carried by customer)`,\n  `     — if effectiveCoverage >= ${targetWeeksOnHand}, EXCLUDE this SKU`,\n  `  Step 4: recommendedQty = (${targetWeeksOnHand} x weeklyVelocity) - customerQOH - openOrderQty, rounded up, minimum ${minRecommendedQty}`,\n  `     — if recommendedQty <= 0 before rounding, EXCLUDE this SKU`,\n  `  Exception: opportunity items the customer does not currently carry bypass the velocity check — recommend minimum ${minRecommendedQty} unit(s) if acmeATS >= 10.`,\n  \"\",\n  `- This customer orders on a ${orderFrequency} cadence`,\n  `- ${casePackRule}`,\n  `- MINIMUM QUANTITY: Never recommend fewer than ${minRecommendedQty} units for any SKU.`,\n  ...(preferredBrands    ? [`- Only recommend brands the customer carries: ${preferredBrands}`] : []),\n  ...(excludedCategories ? [`- Do not recommend: ${excludedCategories}`] : []),\n  \"- When assessing inventory health by sub-family in the narrative, sum customerQOH across all submitted items in that sub-family.\",\n  \"- totalShipped12mo is SKU-specific — do not aggregate across SKUs.\",\n  \"- Prioritize top sellers per sub-family that align with this customer's purchase history.\",\n  \"- Include opportunity items the customer does not carry but company top sellers suggest they should.\",\n  \"- For futureAvailability items, you MUST populate itemNo with a specific Acme item number. Never leave itemNo blank or null.\",\n  \"- CRITICAL — NO DOUBLE-QUOTE CHARACTERS: Never use \\\" anywhere in any string value. Always use '' (two single quotes) for inch measurements.\",\n  \"- Return ONLY the raw JSON object. No preamble, no markdown, no explanation, no asterisks, no bullet points.\"\n].join(\"\\n\");\n\n// ── BUILD ONE OUTPUT ITEM PER CHUNK ─────────────────────────────────────────\n// Only chunk index 0 is asked to write the narrative — it's the only chunk\n// with any special status, and asking every chunk to write one would waste\n// output tokens on 3-4 competing partial narratives that Combine would just\n// have to discard anyway.\nconst outputItems = itemChunks.map((chunkItems, chunkIdx) => {\n  const narrativeInstruction = totalChunks > 1\n    ? (chunkIdx === 0\n        ? `NOTE: This is chunk 1 of ${totalChunks} — only this chunk should write the \"narrative\" field (100-150 words) covering the account overall. `\n        : `NOTE: This is chunk ${chunkIdx + 1} of ${totalChunks} — set \"narrative\" to an empty string \"\". Do not write a narrative for this chunk. `)\n    : '';\n\n  const userPrompt = [\n    `CUSTOMER: ${customer.name ?? customer.customerName ?? 'Unknown'} (ID: ${customer.id ?? customer.customerId ?? 'Unknown'})`,\n    `TODAY'S DATE: ${new Date().toISOString().split('T')[0]}`,\n    `CUSTOMER VOLUME: ${isLowVolume ? `LOW VOLUME (avg weekly sell-through velocity: ${avgWeeklyVelocity.toFixed(2)} units/week across ${itemSummary.length} items — adjust recommendations accordingly)` : 'standard'}`,\n    totalChunks > 1 ? `\\n${narrativeInstruction}This chunk covers ${chunkItems.length} of the customer's ${itemSummary.length} total submitted items — the other chunks cover the rest, so only recommend from the items listed below in this chunk.` : '',\n    \"\",\n    \"FIELD DEFINITIONS FOR ALL DATA BELOW:\",\n    \"- customerQOH = customer's current shelf quantity (from their inventory file, NOT our stock)\",\n    \"- acmeATS = Acme warehouse quantity available to sell (our stock, NOT the customer's)\",\n    \"- totalShipped12mo = units we shipped to this customer in the last 12 months (velocity indicator — never use directly as target)\",\n    \"- openOrderQty = quantity ALREADY ON ORDER and in the pipeline — treat as inventory the customer will have\",\n    \"\",\n    totalChunks > 1\n      ? `SUBMITTED INVENTORY — CHUNK ${chunkIdx + 1} OF ${totalChunks} (${chunkItems.length} items):`\n      : `SUBMITTED INVENTORY (${chunkItems.length} items):`,\n    JSON.stringify(chunkItems),\n    \"\",\n    \"CUSTOMER 12-MONTH PURCHASE HISTORY BY SUB-FAMILY:\",\n    JSON.stringify(historyBySubFamily),\n    \"\",\n    \"OPEN ORDERS:\",\n    JSON.stringify(openOrderSummary),\n    \"\",\n    \"COMPANY-WIDE TOP 5 SELLERS BY SUB-FAMILY:\",\n    JSON.stringify(topSellersBySubFamily),\n    \"\",\n    \"OPPORTUNITY ITEMS (acmeATS >= 10, not in customer submission, sorted by availability):\",\n    JSON.stringify(opptySummary),\n    \"\",\n    \"Return your JSON recommendation now. Start with { and end with }. No other text.\"\n  ].join(\"\\n\");\n\n  return {\n    json: {\n      ...workingObj,\n      topSellersBySubFamily,\n      targetWeeksOnHand,\n      isLowVolume,\n      chunkIndex: chunkIdx,\n      totalChunks: totalChunks,\n      recommenderSystemPrompt: [\n        {\n          type: 'text',\n          text: systemPrompt,\n          cache_control: { type: 'ephemeral' }\n        }\n      ],\n      recommenderMessages: [{ role: 'user', content: userPrompt }]\n    },\n    // Explicit pairedItem required: this node fans out many input items\n    // (mergedItems) into just N chunk items with no natural 1:1\n    // correspondence. Without this, downstream nodes running \"Run Once for\n    // Each Item\" can't resolve $('Build Recommender Prompt Chunked').item\n    // and throw \"Paired item data ... is unavailable\".\n    pairedItem: 0\n  };\n});\n\nreturn outputItems;"
+      },
+      "id": "8bfedf14-676e-4011-8079-b329ceb6603d",
+      "name": "Build Recommender Prompt Chunked",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2288,
+        768
+      ],
+      "notes": "Assembles all data signals into Claude prompt. Summarizes customer history by sub-family, submitted items, open orders, opportunity items, and company top sellers."
+    },
+    {
+      "parameters": {
+        "jsCode": "const raw = $input.first().json;\n\n// ── TARGET WEEKS ON HAND ──────────────────────────────────────────────────\nconst workingObj = $('Stage 3 Trigger').item.json;\n\nlet profile = null;\ntry {\n  const profileRows = $('Get Customer Profile').all();\n  if (profileRows.length > 0 && profileRows[0].json && profileRows[0].json.customer_id) {\n    profile = profileRows[0].json;\n  }\n} catch(e) { profile = null; }\n\n// BUGFIX: raw is the Call Claude API httpRequest node's output, which has\n// no \"include input fields\" option set — it returns only the Claude API\n// response body (content/id/model/usage), never targetWeeksOnHand. That\n// silently fell through to the hardcoded 4 below on every no-profile\n// account, overriding the correct 9/15 split computed upstream. Read it\n// back via the node reference instead, same pattern already used a few\n// lines below for chunkIndex/totalChunks.\nconst targetWeeksOnHand = $('Build Recommender Prompt Chunked').item.json.targetWeeksOnHand\n  ?? profile?.target_weeks_on_hand\n  ?? 4;\n\nconst minRecommendedQty = profile?.min_recommended_qty ?? 1;\n\n// ── CHUNK METADATA ─────────────────────────────────────────────────────────\n// Mirrors the Stage 1 Parse & Validate API Response pattern — read chunk\n// position from the corresponding Build Recommender Prompt output item\n// rather than assuming it survived HTTP node passthrough.\nconst chunkIndex  = $('Build Recommender Prompt Chunked').item.json.chunkIndex  ?? 0;\nconst totalChunks = $('Build Recommender Prompt Chunked').item.json.totalChunks ?? 1;\n\n// ── ITEM LOOKUP ───────────────────────────────────────────────────────────\nconst itemLookup = {};\nfor (const item of (workingObj.items ?? [])) {\n  const key = item.mfrItemNumber ?? item.itemNo ?? item.material ?? '';\n  if (!key) continue;\n  itemLookup[key] = {\n    customerQOH:      item.qtyOnHand                ?? 0,\n    totalShipped12mo: item.sacData?.totalShippedQty ?? 0,\n    openOrderQty:     item.sacData?.openOrderQty    ?? 0\n  };\n}\n\n// ── EXTRACT CLAUDE RESPONSE ───────────────────────────────────────────────\nconst apiResponse = raw.claude_response ?? raw;\nconst contentBlocks = apiResponse?.content ?? [];\n\nlet jsonText = null;\nfor (let i = contentBlocks.length - 1; i >= 0; i--) {\n  const block = contentBlocks[i];\n  if (block.type === 'text' && block.text) {\n    const match = block.text.match(/```json\\s*([\\s\\S]*?)```/g);\n    if (match) {\n      jsonText = match[match.length - 1].replace(/```json\\s*/g, '').replace(/```/g, '').trim();\n      break;\n    }\n    const trimmed = block.text.trim();\n    if (trimmed.startsWith('{')) {\n      jsonText = trimmed;\n      break;\n    }\n  }\n}\n\nif (!jsonText) {\n  throw new Error(`No JSON found in Claude response (chunk ${chunkIndex + 1} of ${totalChunks})`);\n}\n\n// ── SANITIZE ──────────────────────────────────────────────────────────────\n// Step 1a: Strip asterisks/bullets appearing BEFORE quoted property names.\njsonText = jsonText.replace(/[*•]\\s*(?=\"[a-zA-Z])/g, '');\n\n// Step 1b: Strip asterisks/bullets appearing AFTER values before comma/brace.\njsonText = jsonText.replace(/([\"\\d])[*•]+\\s*(?=[,}\\]])/g, '$1');\n\n// Step 2: Scan character by character — escape control chars inside strings.\n// Single quotes inside strings are valid JSON and must NOT be touched.\nfunction sanitizeJson(text) {\n  let out = '';\n  let inStr = false;\n  let esc = false;\n  for (let i = 0; i < text.length; i++) {\n    const ch = text[i];\n    const code = text.charCodeAt(i);\n    if (esc) { out += ch; esc = false; continue; }\n    if (ch === '\\\\') { out += ch; esc = true; continue; }\n    if (ch === '\"') { inStr = !inStr; out += ch; continue; }\n    if (inStr && code < 0x20) {\n      if (ch === '\\n') { out += '\\\\n'; continue; }\n      if (ch === '\\r') { out += '\\\\r'; continue; }\n      if (ch === '\\t') { out += '\\\\t'; continue; }\n      out += '\\\\u' + code.toString(16).padStart(4, '0');\n      continue;\n    }\n    out += ch;\n  }\n  return out;\n}\n\njsonText = sanitizeJson(jsonText);\n\n// Step 3: Fix unquoted property names outside string values.\n// Only fires when a property key has no quotes — safe because it only\n// matches identifiers immediately after { or , followed by a colon.\njsonText = jsonText.replace(/([{,]\\s*)([a-zA-Z_][a-zA-Z0-9_]*)(\\s*:)/g, (match, before, key, colon) => {\n  // Skip if already quoted — check if key is preceded by a quote\n  return `${before}\"${key}\"${colon}`;\n});\n\nlet parsed;\ntry {\n  parsed = JSON.parse(jsonText);\n} catch(e) {\n  throw new Error(`JSON parse failed (chunk ${chunkIndex + 1} of ${totalChunks}): ${e.message}`);\n}\n\n// ── VALID ITEM NUMBER CHECK ───────────────────────────────────────────\nfunction isValidItemNo(itemNo) {\n  if (!itemNo || typeof itemNo !== 'string') return false;\n  const s = itemNo.trim();\n  if (s.length < 5) return false;\n  if (s.includes(' ')) return false;\n  if (/^A-/.test(s)) return true;\n  if (/^9[0-9A-Z]/.test(s)) return true;\n  if (/^\\d{3}-\\d{4}-\\d{2}$/.test(s)) return true;\n  if (/^(BR|BX)/.test(s)) return true;\n  if (/^CH/.test(s)) return true;\n  if (/^(ACC|KIT)/.test(s)) return true;\n  if (/^77\\d{7}$/.test(s)) return true;\n  return false;\n}\n\n// ── EXCLUSION PHRASES ─────────────────────────────────────────────────────\nconst EXCLUSION_PHRASES = [\n  'adequately stocked', 'already covered', 'already at target',\n  'no replenishment needed', 'no reorder needed',\n  'does not need replenishment', 'does not require replenishment',\n  'sufficient stock', 'sufficient inventory', 'overstocked',\n  'above target', 'exceeds target', 'meets target', 'at target',\n  'no action needed'\n];\n\nfunction isExcluded(line) {\n  const rationale = (line.rationale ?? '').toLowerCase();\n  return EXCLUSION_PHRASES.some(phrase => rationale.includes(phrase));\n}\n\n// ── COVERAGE CLASSIFICATION ────────────────────────────────────────────────\n// Independently recomputes the EXACT recommendedQty formula from the\n// recommender's own system prompt (Step 3/Step 4 of the mandatory\n// pre-screening) using the deterministic itemLookup data, instead of\n// trusting Claude's arithmetic.\n//\n//   NOT_IN_SUBMISSION — item isn't in this customer's submitted items at all (opportunity item — not judged by this formula)\n//   NEVER_CARRIED     — customerQOH = 0 AND shipped12mo = 0 — no history to judge; prompt's own stated exception, bypasses the formula\n//   FAILS_FORMULA     — recomputed recommendedQty <= 0 — customer is already covered by QOH + open orders relative to target\n//   PASSES            — recomputed recommendedQty > 0 — genuinely needs replenishment\nfunction classifyCoverage(line) {\n  if (!itemLookup[line.itemNo]) {\n    return { exclude: false, reason: 'NOT_IN_SUBMISSION' };\n  }\n\n  const data           = itemLookup[line.itemNo];\n  const customerQOH    = data.customerQOH      ?? 0;\n  const shipped12mo    = data.totalShipped12mo  ?? 0;\n  const openOrderQty    = data.openOrderQty      ?? 0;\n\n  if (customerQOH === 0 && shipped12mo === 0) {\n    return { exclude: false, reason: 'NEVER_CARRIED' };\n  }\n\n  const soldThrough    = Math.max(0, shipped12mo - customerQOH);\n  const weeklyVelocity = soldThrough / 52;\n  const rawRecQty       = (targetWeeksOnHand * weeklyVelocity) - customerQOH - openOrderQty;\n\n  if (rawRecQty <= 0) {\n    return {\n      exclude: true,\n      reason: 'FAILS_FORMULA',\n      rawRecQty,\n      weeklyVelocity,\n      customerQOH,\n      shipped12mo,\n      openOrderQty\n    };\n  }\n\n  return {\n    exclude: false,\n    reason: 'PASSES',\n    correctedRecQty: Math.max(minRecommendedQty, Math.ceil(rawRecQty)),\n    weeklyVelocity,\n    customerQOH,\n    shipped12mo,\n    openOrderQty\n  };\n}\n\n// ── DEDUP ─────────────────────────────────────────────────────────────────\nfunction dedupByItemNo(lines) {\n  const seen = new Set();\n  return lines.filter(line => {\n    if (!line.itemNo || seen.has(line.itemNo)) return false;\n    seen.add(line.itemNo);\n    return true;\n  });\n}\n\n// ── PROCESS ARRAYS ────────────────────────────────────────────────────────\nconst availableNowClassified = (parsed.availableNow ?? [])\n  .filter(line => isValidItemNo(line.itemNo))\n  .filter(line => !isExcluded(line))\n  .map(line => ({ line, classification: classifyCoverage(line) }));\n\nconst futureAvailabilityClassified = (parsed.futureAvailability ?? [])\n  .filter(line => isValidItemNo(line.itemNo))\n  .filter(line => !isExcluded(line))\n  .map(line => ({ line, classification: classifyCoverage(line) }));\n\nconsole.log(`[chunk ${chunkIndex + 1}/${totalChunks}] availableNow breakdown:`, JSON.stringify(\n  availableNowClassified.map(x => ({ itemNo: x.line.itemNo, ...x.classification }))\n));\nconsole.log(`[chunk ${chunkIndex + 1}/${totalChunks}] futureAvailability breakdown:`, JSON.stringify(\n  futureAvailabilityClassified.map(x => ({ itemNo: x.line.itemNo, ...x.classification }))\n));\n\nlet availableNow = dedupByItemNo(\n  availableNowClassified\n    .filter(x => !x.classification.exclude)\n    .map(x => x.line)\n);\nconst availableNowKeys = new Set(availableNow.map(l => l.itemNo));\n\nlet futureAvailability = dedupByItemNo(\n  futureAvailabilityClassified\n    .filter(x => !x.classification.exclude)\n    .map(x => x.line)\n    .filter(line => !availableNowKeys.has(line.itemNo))\n);\n\n// Only chunk 0 was instructed to write a real narrative — other chunks\n// were told to return an empty string. Combine will only keep chunk 0's.\nconst aiNarrative = parsed.narrative ?? parsed.aiNarrative ?? '';\n\n// ── OUTPUT ────────────────────────────────────────────────────────────────\nreturn [{\n  json: {\n    ...workingObj,\n    aiNarrative,\n    availableNow,\n    futureAvailability,\n    targetWeeksOnHand,\n    chunkIndex,\n    totalChunks\n  }\n}];"
+      },
+      "id": "9caf5d0e-1749-4278-ae7e-fd0cca602a37",
+      "name": "Parse Recommender Response Chunked",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2736,
+        768
+      ],
+      "notes": "Extracts narrative and recommendedOrder[] from Claude response. Strips prompt fields and topSellersBySubFamily to keep the return payload lean. On parse error, sets aiNarrative to error message and recommendedOrder to empty array — Stage 1 will still send the HTML report."
+    },
+    {
+      "parameters": {
+        "jsCode": "// This node must run in \"Run Once for All Items\" mode — it needs to see\n// every chunk's parsed output at once to merge them into a single working\n// object before the rest of Stage 3 proceeds. For accounts under the\n// CHUNK_THRESHOLD in Build Recommender Prompt, this receives exactly 1 item\n// and simply passes it through unchanged (the merge logic is a no-op with\n// only one chunk).\nconst allChunks = $input.all().map(i => i.json);\nif (allChunks.length === 0) throw new Error('Combine Recommender Chunks FATAL: no chunk data received.');\n\n// ── DEDUP ACROSS CHUNKS ─────────────────────────────────────────────────────\n// Chunks are disjoint slices of itemSummary, so the same itemNo shouldn't\n// legitimately appear in two chunks' availableNow/futureAvailability — but\n// dedup anyway as a safety net (e.g. against a hallucinated itemNo that\n// happens to collide, or an opportunity item both chunks independently\n// picked up since opportunity items aren't chunk-scoped).\nfunction dedupByItemNo(lines) {\n  const seen = new Set();\n  return lines.filter(line => {\n    if (!line.itemNo || seen.has(line.itemNo)) return false;\n    seen.add(line.itemNo);\n    return true;\n  });\n}\n\nlet combinedAvailableNow = dedupByItemNo(\n  allChunks.flatMap(chunk => chunk.availableNow ?? [])\n);\nconst availableNowKeys = new Set(combinedAvailableNow.map(l => l.itemNo));\n\nlet combinedFutureAvailability = dedupByItemNo(\n  allChunks\n    .flatMap(chunk => chunk.futureAvailability ?? [])\n    .filter(line => !availableNowKeys.has(line.itemNo))\n);\n\n// ── NARRATIVE ────────────────────────────────────────────────────────────\n// Only chunk 0 was instructed to write a real narrative in the prompt —\n// every other chunk was told to return an empty string. Take the first\n// non-empty one found, defaulting to chunk 0's regardless.\nconst chunk0 = allChunks.find(c => (c.chunkIndex ?? 0) === 0) ?? allChunks[0];\nconst aiNarrative = allChunks.find(c => (c.aiNarrative ?? '').trim().length > 0)?.aiNarrative\n  ?? chunk0.aiNarrative\n  ?? '';\n\n// ── SPARSE-ACCOUNT FLOOR (only fires when recommendations are genuinely thin) ──\n// This is deliberately gated behind SPARSE_THRESHOLD so it NEVER touches an\n// account that already has a healthy recommendation count — it only ever\n// ADDS lines (never removes or replaces anything), and it only runs at all\n// when the AI's own output came back sparse, like the Chattanooga case that\n// prompted this (a handful of recommendations against 100+ real opportunities).\n// An account with, say, 8 solid recommendations and 0 opportunity items is\n// left completely untouched — this is not a general-purpose opportunity\n// quota, it's a safety net for near-empty results specifically.\nconst SPARSE_THRESHOLD = 5;      // if total recommendations are below this, the account is considered sparse\nconst FLOOR_MIN_TOTAL = 10;      // target total once backfill is triggered\nconst FLOOR_MIN_OPPORTUNITY = 5; // target opportunity-sourced count once backfill is triggered\nconst MIN_OPPORTUNITY_ATS = 10;  // mirrors the prompt's own opportunity-item eligibility threshold\n\n// Same blocklist as Build Recommender Prompt Chunked — kept in sync\n// manually since this node has no access to that node's local constant.\nconst BLOCKLISTED_SKUS = [\n  'A-100234-XX',\n  'A-100235-XX'\n];\n\nlet totalCount = combinedAvailableNow.length + combinedFutureAvailability.length;\nconst isSparse = totalCount < SPARSE_THRESHOLD;\n\nconst backfillLog = [];\n\nif (isSparse) {\n  const submittedItemNos = new Set(\n    (chunk0.items ?? [])\n      .map(i => i.mfrItemNumber ?? i.itemNo ?? i.material)\n      .filter(Boolean)\n  );\n\n  function isOpportunitySourced(itemNo) {\n    return !submittedItemNos.has(itemNo);\n  }\n\n  let opportunityCount = [...combinedAvailableNow, ...combinedFutureAvailability]\n    .filter(line => isOpportunitySourced(line.itemNo)).length;\n\n  const usedItemNos = new Set([...combinedAvailableNow, ...combinedFutureAvailability].map(l => l.itemNo));\n\n  const pool = (chunk0.opportunityItems ?? [])\n    .filter(o => (o.ats ?? 0) >= MIN_OPPORTUNITY_ATS)\n    .filter(o => !BLOCKLISTED_SKUS.includes(o.material))\n    .filter(o => !usedItemNos.has(o.material))\n    .filter(o => !submittedItemNos.has(o.material))\n    .sort((a, b) => (b.ats ?? 0) - (a.ats ?? 0));\n\n  for (const o of pool) {\n    if (totalCount >= FLOOR_MIN_TOTAL && opportunityCount >= FLOOR_MIN_OPPORTUNITY) break;\n\n    const line = {\n      itemNo:      o.material,\n      custQOH:     0,\n      wklyVel:     0,\n      currWOS:     0,\n      targetWOS:   chunk0.targetWeeksOnHand ?? 4,\n      targetQty:   1,\n      onOrderQty:  o.openOrderQty ?? 0,\n      recQty:      1,\n      netPrice:    o.netSellPrice ?? 0,\n      rationale:   `Auto-added by sparse-recommendation floor: Acme has ${o.ats} units available and this SKU is not currently carried by the customer; included because this account's recommendations came back sparse (${totalCount} before backfill).`,\n      source:      'floor-backfill'\n    };\n\n    combinedAvailableNow.push(line);\n    usedItemNos.add(o.material);\n    totalCount++;\n    opportunityCount++;\n    backfillLog.push(o.material);\n  }\n\n  if (totalCount < FLOOR_MIN_TOTAL || opportunityCount < FLOOR_MIN_OPPORTUNITY) {\n    console.log(`[floor-backfill] Sparse account, but opportunity pool exhausted before reaching floor. Final: total=${totalCount}, opportunity=${opportunityCount}`);\n  }\n  if (backfillLog.length > 0) {\n    console.log(`[floor-backfill] Account was sparse (< ${SPARSE_THRESHOLD} total) — added ${backfillLog.length} item(s):`, JSON.stringify(backfillLog));\n  }\n}\n\n// ── OUTPUT ───────────────────────────────────────────────────────────────\nconst workingObject = {\n  ...chunk0,\n  availableNow: combinedAvailableNow,\n  futureAvailability: combinedFutureAvailability,\n  aiNarrative,\n  chunksProcessed: allChunks.length\n};\n\n// chunkIndex/totalChunks were only relevant during processing — strip them\n// from the final combined object so they don't leak into the report.\ndelete workingObject.chunkIndex;\ndelete workingObject.totalChunks;\n\nreturn { json: workingObject };"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2960,
+        768
+      ],
+      "id": "f82db385-e02f-485f-9ece-9a4208ea18e8",
+      "name": "Combine Recommender Chunks"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT material AS \"MATERIAL\", description AS \"DESCRIPTION\", material_type AS \"MATERIAL_TYPE\", material_group AS \"MATERIAL_GROUP\", plant AS \"PLANT\", family AS \"FAMILY\", mgd2 AS \"MGD2\", upc AS \"UPC\" FROM materials WHERE material_type != 'ROH'",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        1472,
+        752
+      ],
+      "id": "c9bab676-d28d-4d54-a723-6339e40a8f7c",
+      "name": "Get Material Master",
+      "credentials": {
+        "postgres": {
+          "id": "REPLACE_ME",
+          "name": "Postgres account"
+        }
+      }
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Get SAC Token": {
+      "main": [
+        [
+          {
+            "node": "Get Top Sellers",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Get Customer Profile",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Get Material Master",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Top Sellers": {
+      "main": [
+        [
+          {
+            "node": "Unpack Top Sellers",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Unpack Top Sellers": {
+      "main": [
+        [
+          {
+            "node": "Merge",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Call Claude API (Recommender)": {
+      "main": [
+        [
+          {
+            "node": "Parse Recommender Response Chunked",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge": {
+      "main": [
+        [
+          {
+            "node": "Merge1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Stage 3 Trigger": {
+      "main": [
+        [
+          {
+            "node": "Get SAC Token",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Customer Profile": {
+      "main": [
+        [
+          {
+            "node": "Merge1",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Merge1": {
+      "main": [
+        [
+          {
+            "node": "Build Recommender Prompt Chunked",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Recommender Prompt Chunked": {
+      "main": [
+        [
+          {
+            "node": "Call Claude API (Recommender)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Recommender Response Chunked": {
+      "main": [
+        [
+          {
+            "node": "Combine Recommender Chunks",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Combine Recommender Chunks": {
+      "main": [
+        [
+          {
+            "node": "Stage 3 Complete — Output",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Material Master": {
+      "main": [
+        [
+          {
+            "node": "Merge",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  },
+  "meta": {
+    "templateCredsSetupCompleted": false
+  },
+  "tags": []
+}

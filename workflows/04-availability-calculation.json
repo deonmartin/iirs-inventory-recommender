@@ -1,0 +1,685 @@
+{
+  "name": "ATS For IIRS",
+  "nodes": [
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://your-tenant.authentication.region.hana.ondemand.com/oauth/token",
+        "sendBody": true,
+        "contentType": "form-urlencoded",
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "grant_type",
+              "value": "client_credentials"
+            },
+            {
+              "name": "client_id",
+              "value": "YOUR_CLIENT_ID"
+            },
+            {
+              "name": "client_secret",
+              "value": "YOUR_CLIENT_SECRET"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.3,
+      "position": [
+        -1344,
+        752
+      ],
+      "id": "939a7715-b695-4ef3-81cc-d7ecc7f03874",
+      "name": "Get SAC Token"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Filter out \"0\" ATS\nconst allowedMGD2 = ['CATEGORY A US','CATEGORY A BR','CATEGORY B US','CATEGORY B BR','CATEGORY C US','CATEGORY C BR'];\nreturn $input.all()\n  .filter(item =>\n    allowedMGD2.includes((item.json.MGD2 || '').trim().toUpperCase()) &&\n    item.json.netSellPrice != null &&\n    item.json.netSellPrice !== 0 &&\n    item.json.ATS > 0\n  )\n  .map(item => ({ json: { ...item.json, FAMILY: (item.json.FAMILY || '').trim(), MGD2: (item.json.MGD2 || '').trim() } }));"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        896,
+        752
+      ],
+      "id": "9e2d076b-6c5e-4b02-ae0e-5c9b530d71f5",
+      "name": "Filter out \"0\" ATS"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Format Merge\nconst allowedMGD2 = ['CATEGORY A US','CATEGORY A BR','CATEGORY B US','CATEGORY B BR','CATEGORY C US','CATEGORY C BR'];\nreturn $input.all()\n  .filter(item => allowedMGD2.includes((item.json.MGD2 || '').trim().toUpperCase()))\n  .map(item => ({ json: { ...item.json, FAMILY: (item.json.FAMILY || '').trim(), MGD2: (item.json.MGD2 || '').trim() } }));\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        672,
+        752
+      ],
+      "id": "26687ace-44a4-4474-9c91-dbf5a3a201a3",
+      "name": "Format Merge"
+    },
+    {
+      "parameters": {
+        "inputSource": "passthrough"
+      },
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        -1568,
+        752
+      ],
+      "id": "bde55940-3960-4163-a4f3-b1e393aee08f",
+      "name": "When Executed by Another Workflow"
+    },
+    {
+      "parameters": {
+        "mode": "raw",
+        "options": {}
+      },
+      "id": "487562e2-3d9d-4793-8603-f5ea60bc2337",
+      "name": "ATS OUTPUT COMPLETE",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3,
+      "position": [
+        1120,
+        752
+      ],
+      "notes": "End of the ATS for IIRS Workflow"
+    },
+    {
+      "parameters": {
+        "jsCode": "const rows = $input.all()[0].json.value;\n\nreturn rows\n  .filter(row => row.MATERIAL)\n  .map(row => ({\n    json: {\n      MATERIAL: row.MATERIAL,\n      IN_DELIVERY: row.ACTUALDELIVERYQUANTITY ?? 0\n    }\n  }));"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -672,
+        656
+      ],
+      "id": "5556eca1-0a3e-451b-84be-5c91099e0394",
+      "name": "Agregate On Order1"
+    },
+    {
+      "parameters": {
+        "url": "https://your-tenant.region.analytics.cloud.sap/api/v1/dataexport/providers/sac/PROVIDER_ID_GET_IN_DELIVERY/FactData?$top=20000&$filter=SDPROCESSSTATUS eq 'A'",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "$top",
+              "value": "20000"
+            }
+          ]
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{$node[\"Get SAC Token\"].json[\"access_token\"]}}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            },
+            {
+              "name": "Accept",
+              "value": "application/json"
+            }
+          ]
+        },
+        "options": {
+          "batching": {
+            "batch": {
+              "batchSize": 5000
+            }
+          }
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.3,
+      "position": [
+        -896,
+        656
+      ],
+      "id": "d677c3a6-dc40-4db4-9190-f3bade6a3a63",
+      "name": "Get In Delivery"
+    },
+    {
+      "parameters": {
+        "mode": "combine",
+        "fieldsToMatchString": "MATERIAL",
+        "joinMode": "enrichInput1",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3.2,
+      "position": [
+        -448,
+        464
+      ],
+      "id": "995b7bf8-d064-46b9-9765-6a2d0395a3e5",
+      "name": "Merge5"
+    },
+    {
+      "parameters": {
+        "url": "https://your-tenant.region.analytics.cloud.sap/api/v1/dataexport/providers/sac/PROVIDER_ID_GET_QOH1/FactData",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "$top",
+              "value": "20000"
+            }
+          ]
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{$node[\"Get SAC Token\"].json[\"access_token\"]}}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            },
+            {
+              "name": "Accept",
+              "value": "application/json"
+            }
+          ]
+        },
+        "options": {
+          "batching": {
+            "batch": {
+              "batchSize": 5000
+            }
+          }
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.3,
+      "position": [
+        -1120,
+        272
+      ],
+      "id": "dead4ee5-2225-4030-87e1-19a5ce236a96",
+      "name": "Get QOH1"
+    },
+    {
+      "parameters": {
+        "mode": "combine",
+        "advanced": true,
+        "mergeByFields": {
+          "values": [
+            {
+              "field1": "MATERIAL",
+              "field2": "MATERIAL"
+            }
+          ]
+        },
+        "joinMode": "enrichInput1",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3.2,
+      "position": [
+        -672,
+        368
+      ],
+      "id": "61b79d20-c319-47fc-a98c-52420e04e055",
+      "name": "Merge"
+    },
+    {
+      "parameters": {
+        "jsCode": "const stockData = $input.all()[0].json.value;\n\nreturn stockData.map(item => ({\n  json: {\n    MATERIAL: item.MATERIAL,\n    UOH: item.MATLWRHSSTKQTYINMATLBASEUNIT || 0\n  }\n}));"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -896,
+        272
+      ],
+      "id": "bbd4d377-cad0-4987-9a3d-9c35247eed6b",
+      "name": "QOH unpack1"
+    },
+    {
+      "parameters": {
+        "jsCode": "return $input.all().map(item => {\n  const data = item.json;\n  const uoh = data.UOH || 0;\n  const oo30d = data.OO_30D || 0;\n  const totalOO = data.TOTAL_OO || 0;\n  const inDelivery = data.IN_DELIVERY || 0;\n  const ats = Math.max(0, (uoh - oo30d) - inDelivery);\n\n  return {\n    json: {\n      MATERIAL: data.MATERIAL,\n      UOH: uoh,\n      IN_DELIVERY: inDelivery,\n      TOTAL_OO: totalOO,\n      OO_30D: oo30d,\n      ATS: ats\n    }\n  };\n});"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -224,
+        464
+      ],
+      "id": "43fc5944-ae96-447e-9326-de12afb556a2",
+      "name": "Calculate ATS1"
+    },
+    {
+      "parameters": {
+        "mode": "combine",
+        "advanced": true,
+        "mergeByFields": {
+          "values": [
+            {
+              "field1": "MATERIAL",
+              "field2": "MATERIAL"
+            }
+          ]
+        },
+        "joinMode": "enrichInput1",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3.2,
+      "position": [
+        0,
+        560
+      ],
+      "id": "9818276a-6cc5-4baa-b654-d36e2406bbe5",
+      "name": "Merge6"
+    },
+    {
+      "parameters": {
+        "url": "https://your-tenant.region.analytics.cloud.sap/api/v1/dataexport/providers/sac/PROVIDER_ID_GET_NET_SELL1/FactData",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "$top",
+              "value": "50000"
+            },
+            {
+              "name": "$filter",
+              "value": "=CUSTOMERPRICEGROUP eq 'ZN' and CONDITIONVALIDITYSTARTDATE le '{{ $now.format('yyyy-MM-dd') }}' and CONDITIONVALIDITYENDDATE ge '{{ $now.format('yyyy-MM-dd') }}'"
+            }
+          ]
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{$node[\"Get SAC Token\"].json[\"access_token\"]}}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            },
+            {
+              "name": "Accept",
+              "value": "application/json"
+            }
+          ]
+        },
+        "options": {
+          "batching": {
+            "batch": {
+              "batchSize": 5000
+            }
+          }
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.3,
+      "position": [
+        -224,
+        1024
+      ],
+      "id": "4cbac1fd-fa87-4495-ad52-d94bc9e5f7b3",
+      "name": "Get Net Sell1"
+    },
+    {
+      "parameters": {
+        "jsCode": "const items = $input.all()[0].json.value;\n\nconst pricingMap = {};\nitems.forEach(item => {\n  if (item.MATERIAL && item.CONDITIONRATEVALUE) {\n    pricingMap[item.MATERIAL] = {\n      material: item.MATERIAL,\n      netSellPrice: item.CONDITIONRATEVALUE,\n      currency: item.CONDITIONRATEVALUEUNIT\n    };\n  }\n});\n\nreturn Object.values(pricingMap).map(p => ({ json: p }));"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        0,
+        1024
+      ],
+      "id": "97ab35e4-3544-4212-ba81-35f42bd79c95",
+      "name": "Reduce Columns1"
+    },
+    {
+      "parameters": {
+        "mode": "combine",
+        "advanced": true,
+        "mergeByFields": {
+          "values": [
+            {
+              "field1": "MATERIAL",
+              "field2": "material"
+            }
+          ]
+        },
+        "joinMode": "enrichInput1",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3.2,
+      "position": [
+        224,
+        656
+      ],
+      "id": "3bbd39f6-0d25-41fa-9fea-c25c63de2452",
+      "name": "Merge7"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT material AS \"MATERIAL\", description AS \"DESCRIPTION\", material_type AS \"MATERIAL_TYPE\", material_group AS \"MATERIAL_GROUP\", plant AS \"PLANT\", family AS \"FAMILY\", mgd2 AS \"MGD2\", upc AS \"UPC\" FROM materials WHERE material_type != 'ROH'",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        -528,
+        816
+      ],
+      "id": "76e12283-c172-4a8c-87b0-ea46edc6f3c7",
+      "name": "Get Material Master",
+      "credentials": {
+        "postgres": {
+          "id": "REPLACE_ME",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "url": "https://your-tenant.region.analytics.cloud.sap/api/v1/dataexport/providers/sac/PROVIDER_ID_GET_ON_ORDER/FactData",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "$top",
+              "value": "300000"
+            }
+          ]
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{$node[\"Get SAC Token\"].json[\"access_token\"]}}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            },
+            {
+              "name": "Accept",
+              "value": "application/json"
+            }
+          ]
+        },
+        "options": {
+          "batching": {
+            "batch": {
+              "batchSize": 5000
+            }
+          }
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.3,
+      "position": [
+        -1120,
+        480
+      ],
+      "id": "07849baf-3901-4dd7-9b29-ff3979590469",
+      "name": "Get On Order"
+    },
+    {
+      "parameters": {
+        "jsCode": "const today = new Date();\nconst thirtyDaysOut = new Date();\nthirtyDaysOut.setDate(today.getDate() + 30);\n\nconst orders = $input.all()[0].json.value;\nconst aggregated = {};\n\nfor (const order of orders) {\n  // Skip rejected lines (only keep blank rejection reason)\n  if (order.SALESDOCUMENTRJCNREASON && order.SALESDOCUMENTRJCNREASON !== '') continue;\n\n  // Skip completed lines (Overall Delivery Status = C)\n  if (order.OVERALLDELIVERYSTATUS === 'C') continue;\n\n  const material = order.MATERIAL;\n  const openQty = (order.REQUESTEDQUANTITY || 0) - (order.CONFDDELIVQTYINORDERQTYUNIT || 0);\n  const delivDate = new Date(order.REQUESTEDDELIVERYDATE);\n\n  if (!aggregated[material]) {\n    aggregated[material] = { MATERIAL: material, TOTAL_OO: 0, OO_30D: 0 };\n  }\n\n  aggregated[material].TOTAL_OO += openQty;\n\n  if (delivDate <= thirtyDaysOut) {\n    aggregated[material].OO_30D += openQty;\n  }\n}\n\nreturn Object.values(aggregated).map(item => ({ json: item }));"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -896,
+        480
+      ],
+      "id": "5aebbf96-ec49-4815-ad9c-8a3cbf984a6c",
+      "name": "Agregate On Order"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Get SAC Token": {
+      "main": [
+        [
+          {
+            "node": "Get QOH1",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Get In Delivery",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Get Net Sell1",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Get Material Master",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Get On Order",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Filter out \"0\" ATS": {
+      "main": [
+        [
+          {
+            "node": "ATS OUTPUT COMPLETE",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Merge": {
+      "main": [
+        [
+          {
+            "node": "Filter out \"0\" ATS",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "When Executed by Another Workflow": {
+      "main": [
+        [
+          {
+            "node": "Get SAC Token",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Agregate On Order1": {
+      "main": [
+        [
+          {
+            "node": "Merge5",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Get In Delivery": {
+      "main": [
+        [
+          {
+            "node": "Agregate On Order1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge5": {
+      "main": [
+        [
+          {
+            "node": "Calculate ATS1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get QOH1": {
+      "main": [
+        [
+          {
+            "node": "QOH unpack1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge": {
+      "main": [
+        [
+          {
+            "node": "Merge5",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "QOH unpack1": {
+      "main": [
+        [
+          {
+            "node": "Merge",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Calculate ATS1": {
+      "main": [
+        [
+          {
+            "node": "Merge6",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge6": {
+      "main": [
+        [
+          {
+            "node": "Merge7",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Net Sell1": {
+      "main": [
+        [
+          {
+            "node": "Reduce Columns1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Reduce Columns1": {
+      "main": [
+        [
+          {
+            "node": "Merge7",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Merge7": {
+      "main": [
+        [
+          {
+            "node": "Format Merge",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Material Master": {
+      "main": [
+        [
+          {
+            "node": "Merge6",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Get On Order": {
+      "main": [
+        [
+          {
+            "node": "Agregate On Order",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Agregate On Order": {
+      "main": [
+        [
+          {
+            "node": "Merge",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "availableInMCP": false
+  },
+  "meta": {
+    "templateCredsSetupCompleted": false
+  },
+  "tags": []
+}

@@ -1,0 +1,1443 @@
+{
+  "name": "STAGE 1 - Inventory Ingestion Core",
+  "nodes": [
+    {
+      "parameters": {
+        "fields": {
+          "values": [
+            {
+              "name": "senderEmail",
+              "stringValue": "=={{ $('Microsoft Outlook Trigger').item.json.from?.emailAddress?.address ?? '' }}"
+            },
+            {
+              "name": "subject",
+              "stringValue": "=={{ $('Microsoft Outlook Trigger').item.json.subject ?? '(no subject)' }}"
+            },
+            {
+              "name": "receivedAt",
+              "stringValue": "=={{ $('Microsoft Outlook Trigger').item.json.receivedDateTime ?? $now.toISO() }}"
+            },
+            {
+              "name": "emailBody",
+              "stringValue": "=={{ $('Microsoft Outlook Trigger').item.json.body?.content ?? '' }}"
+            },
+            {
+              "name": "workflowRunId",
+              "stringValue": "=={{ 'run_' + Date.now() + '_' + Math.random().toString(36).substring(2,8) }}"
+            },
+            {
+              "name": "senderName",
+              "stringValue": "=={{ $('Microsoft Outlook Trigger').item.json.from?.emailAddress?.name ?? '' }}"
+            },
+            {
+              "name": "customerId",
+              "stringValue": "=={{ $('Microsoft Outlook Trigger').item.json.subject?.match(/\\d{7}/)?.[0] ?? 'NO_ID' }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "18488901-aa64-419e-8c5f-27d6b4ea9f81",
+      "name": "Initialize Envelope",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3,
+      "position": [
+        -3008,
+        432
+      ]
+    },
+    {
+      "parameters": {
+        "fields": {
+          "values": [
+            {
+              "name": "errorType",
+              "stringValue": "FATAL_INVALID_SENDER"
+            },
+            {
+              "name": "errorMessage",
+              "stringValue": "=={{ 'Stage 1 FATAL: Invalid sender email - ' + $json.senderEmail }}"
+            },
+            {
+              "name": "workflowRunId",
+              "stringValue": "=={{ $json.workflowRunId }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "12214297-6251-49eb-bef2-669c8db1fad2",
+      "name": "FATAL - Invalid Sender",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3,
+      "position": [
+        -2112,
+        432
+      ],
+      "notes": "Connect output of this node to an error notification email node and a workflow halt. Do not proceed to Stage 2."
+    },
+    {
+      "parameters": {
+        "jsCode": "const item = $input.first().json;\nlet rows = item.data || [];\nconst subject = $('Microsoft Outlook Trigger').item.json.subject || '';\nconst customerIdMatch = subject.match(/\\d{7}/);\nconst customerId = customerIdMatch ? customerIdMatch[0] : null;\n\nif (rows.length === 0) throw new Error('Stage 1 FATAL: No inventory rows found in extracted data.');\n\n// ── BRAND PREFIX STRIPPING (deterministic, not AI-guessed) ────────────────\nconst BRAND_COL_PATTERN = /^(brand|mfg|manufacturer|line|category|cat)$/i;\nconst ITEM_COL_PATTERN = /sku|item|part|model|mfg.*(sku|part|num)|product.*num/i;\n\nconst firstRowKeys = Object.keys(rows[0] || {});\nconst brandCol = firstRowKeys.find(k => BRAND_COL_PATTERN.test(k.trim()));\nconst itemCol = firstRowKeys.find(k => ITEM_COL_PATTERN.test(k) && k !== brandCol);\n\nif (brandCol && itemCol) {\n  rows = rows.map(row => {\n    const brandVal = String(row[brandCol] ?? '').trim();\n    const itemVal = String(row[itemCol] ?? '').trim();\n    if (\n      brandVal.length >= 2 && brandVal.length <= 6 &&\n      /^[A-Za-z]+$/.test(brandVal) &&\n      itemVal.toUpperCase().startsWith(brandVal.toUpperCase())\n    ) {\n      const stripped = itemVal.slice(brandVal.length);\n      if (stripped.length >= 5) {\n        return { ...row, [itemCol]: stripped };\n      }\n    }\n    return row;\n  });\n}\n\nconst SYSTEM_FIELDS = new Set([\n  'senderEmail','senderName','subject','receivedAt','emailBody','workflowRunId',\n  'attachmentName','attachmentType','inventoryBinaryKey','hasContent',\n  'contentIsBase64','rawContent','allInventoryAttachments','skippedAttachments',\n  '_debug_binaryKeys','_debug_binaryData','errorType','errorMessage'\n]);\n\n// availab catches both Available and Availability\n// part/num/ref are word-bounded to prevent false matches inside prose\n// (e.g. \"Sparta\" contains \"part\", \"prefer\" contains \"ref\", \"minimum\" contains \"num\")\n// inv/inventory added for customer files using that abbreviation for on-hand qty (e.g. a distributor \"Inv\" column)\n// qas added for customer files using \"QAS\" (Quantity Available for Sale) as their on-hand column\n// (e.g. Monthly_Inventory_Report_by_item.xlsx) -- word-bounded so it doesn't\n// false-match inside unrelated words\nconst KEEP_CONTENT = /sku|item|\\bpart\\b|model|mfg|product|qty|quantity|on.?hand|qoh|qtyoh|upc|number|\\bnum\\b|\\bref\\b|stock|style|tqoh|availab|\\boh\\b|\\binv\\b|\\binventory\\b|\\bqas\\b/i;\n\n// ── SMART HEADER DETECTION ────────────────────────────────────────────────\nlet headers = Object.keys(rows[0]).filter(k =>\n  !SYSTEM_FIELDS.has(k) && KEEP_CONTENT.test(k)\n);\n\n// Force smart header scan when row 0 contains address/metadata content\nconst row0Values = Object.values(rows[0]).map(v => String(v ?? ''));\nconst row0HasMetadata = row0Values.some(v =>\n  v.includes('\\n') ||\n  /\\d{3}[-.\\s]\\d{3}[-.\\s]\\d{4}/.test(v) ||\n  v.length > 60\n);\n\nif (headers.length < 2 || row0HasMetadata) {\n  let foundRealHeaders = false;\n  for (let i = 0; i < Math.min(rows.length, 20); i++) {\n    const row = rows[i];\n    const candidateHeaders = Object.values(row).filter(v =>\n      v != null && KEEP_CONTENT.test(String(v))\n    );\n    if (candidateHeaders.length >= 2) {\n      const colMap = {};\n      Object.entries(row).forEach(([k, v]) => {\n        if (v != null && String(v).trim() !== '') {\n          colMap[k] = String(v).trim();\n        }\n      });\n\n      headers = Object.values(colMap).filter(v => KEEP_CONTENT.test(v));\n\n      const dataRows = rows.slice(i + 1).map(dataRow => {\n        const remapped = {};\n        Object.entries(colMap).forEach(([oldKey, newLabel]) => {\n          remapped[newLabel] = dataRow[oldKey] ?? null;\n        });\n        return remapped;\n      });\n\n      rows = dataRows;\n      foundRealHeaders = true;\n      break;\n    }\n  }\n\n  if (!foundRealHeaders) {\n    headers = Object.keys(rows[0]).filter(k => !SYSTEM_FIELDS.has(k));\n  }\n}\n\n// ── DETERMINISTIC QOH LOOKUP (JS-side, bypasses AI judgment for the number) ──\nconst QTY_COL_PRIORITY = [\n  /\\bqoh\\b/i, /\\bqtyoh\\b/i, /\\btqoh\\b/i, /\\bqas\\b/i,\n  /on.?hand/i,\n  /availab/i,\n  /qty.?avail|quantity.?avail/i,\n  /\\bqty\\b|\\bquantity\\b/i,\n  /\\binv\\b|\\binventory\\b/i,\n  /\\bstock\\b/i\n];\n// '#' excluded because a true on-hand-quantity column is never labeled with a\n// trailing '#' -- that convention is reserved for identifier/reference fields\n// (Item #, PO #, Inventory #, Model #). Without this, a header like\n// 'Inventory #' (an identifier column) satisfies /\\binventory\\b/i just as well\n// as 'Inv' (the real quantity column) at the same priority tier, and since\n// pickBestColumn takes the first array match, an earlier-positioned identifier\n// column can beat the real quantity column and get treated as authoritative.\n// (Root cause of the a distributor 2026-08-31 QOH corruption.)\nconst QTY_COL_EXCLUDE = /on.?order|backorder|back.?order|sold|shipped|committed|allocated|\\bcost\\b|\\btotal\\b|\\bprice\\b|#/i;\nconst ITEM_ID_COL_PATTERN = /sku|item|\\bpart\\b|model|mfg|product|style|number|\\bnum\\b|\\bref\\b/i;\n\nfunction pickBestColumn(candidateHeaders, priorityList, excludePattern) {\n  const eligible = candidateHeaders.filter(h => !excludePattern.test(h));\n  for (const pattern of priorityList) {\n    const match = eligible.find(h => pattern.test(h));\n    if (match) return match;\n  }\n  return null;\n}\n\nconst qtyCol = pickBestColumn(headers, QTY_COL_PRIORITY, QTY_COL_EXCLUDE);\nconst itemIdCol = headers.find(h => ITEM_ID_COL_PATTERN.test(h) && h !== qtyCol) || headers[0];\n\nconst qtyLookup = {};\nif (qtyCol && itemIdCol) {\n  rows.forEach(row => {\n    const refKey = String(row[itemIdCol] ?? '').trim().toUpperCase();\n    if (!refKey) return;\n    const rawQty = row[qtyCol];\n    const numQty = typeof rawQty === 'number'\n      ? rawQty\n      : parseFloat(String(rawQty ?? '').replace(/[^0-9.\\-]/g, ''));\n    if (!Number.isNaN(numQty)) {\n      qtyLookup[refKey] = (qtyLookup[refKey] ?? 0) + numQty;\n    }\n  });\n}\n\n// ── CHUNKING (only for genuinely large submissions) ────────────────────────\n// Accounts at or under CHUNK_THRESHOLD rows are unaffected — they still\n// produce exactly one chunk, meaning one API call, identical to current\n// behavior. Only submissions larger than any current account (Sports South\n// at ~789 rows is the only one today) actually get split. This keeps every\n// other customer's processing byte-for-byte unchanged.\nconst CHUNK_THRESHOLD = 500;\nconst CHUNK_SIZE = 150;\n\nconst rowChunks = [];\nif (rows.length > CHUNK_THRESHOLD) {\n  for (let i = 0; i < rows.length; i += CHUNK_SIZE) {\n    rowChunks.push(rows.slice(i, i + CHUNK_SIZE));\n  }\n} else {\n  rowChunks.push(rows);\n}\nconst totalChunks = rowChunks.length;\n\n// ── CSV HELPER ─────────────────────────────────────────────────────────────\nconst csvVal = (val) => {\n  const s = String(val ?? '');\n  return (s.includes(',') || s.includes('\"') || s.includes('\\n'))\n    ? '\"' + s.replace(/\"/g, '\"\"') + '\"'\n    : s;\n};\n\n// ── SYSTEM PROMPT (shared across all chunks) ───────────────────────────────\nconst systemPrompt = `You are an inventory data extraction specialist for Acme Manufacturing, a consumer-products manufacturer that sells through distributors and retailers. Acme sells three brands: Alpha, Bravo, and Charlie.\n\nExtract inventory line items from the CSV and return ONLY compact JSON with no whitespace, no newlines, no indentation. No explanation, no markdown, no code fences.\n\nACME SKU FORMATS (fictional examples):\n- Alpha products (A- prefix): A-100234-17, A-2200XY-0, A-3AB65201\n- Alpha accessories (NNN-NNNN-NN pattern): 111-2222-33, 111-2300-01, 222-0001-00\n- Alpha accessories (9XXXXX pattern): 912345678, 913579246, 91P123456\n- Alpha accessories with a standalone suffix (valid complete SKUs, never strip the suffix): 912345678XX, 913579246YY\n- Bravo products (BR prefix): BR22B4, BR22MB6, BR22CH4\n- Bravo products (BX prefix): BX1218CH, BX2018BK\n- Charlie products (CH prefix): CH22L1811, CH22W2111\n- Legacy numeric pattern (9-digit numbers beginning with 77): 771234567. These are older part numbers that were later renumbered.\n- UPCs are 12 or 13 digit numbers\n- Anything else is a customer SKU\n\nLEADING ZERO NORMALIZATION:\nSome customers or systems (including ERP exports) send Acme SKUs with leading zeros prepended (e.g. 000912345678). Apply this rule:\n- If a value begins with one or more leading zeros followed by a valid Acme SKU pattern, strip the leading zeros and use the result as mfrItemNumber.\n- Example: 000912345678 → mfrItemNumber: 912345678\n- Example: 000913579246 → mfrItemNumber: 913579246\n- Always set rawItemRef to the original value exactly as it appears in the CSV.\n- Do NOT strip leading zeros if the result does not match a known Acme SKU pattern.\n- Do NOT apply this rule to SKUs with a standalone suffix. Those are complete SKUs and must be used as-is.\n\nCASE NORMALIZATION:\nCustomer files sometimes submit Acme SKUs in lowercase or mixed case (e.g. a-100234, br22b4). Apply this rule:\n- SKU matching is case-insensitive. If a rawItemRef matches an Acme SKU pattern regardless of case, populate mfrItemNumber with the value converted to UPPERCASE.\n- Example: a-100234 → mfrItemNumber: A-100234\n- Example: br22b4 → mfrItemNumber: BR22B4\n- Always set rawItemRef to the original value exactly as it appears in the CSV. Do not uppercase rawItemRef.\n\nRULES:\n- rawItemRef: item identifier exactly as it appears in the CSV. Preserve original casing and formatting.\n- mfrItemNumber: if it matches an Acme SKU pattern above (case-insensitive, after leading zero normalization if applicable), populate it with the UPPERCASE normalized value. Otherwise null.\n- qtyOnHand: quantity on hand as a number. null if absent.\n- upc: if the data contains a separate UPC column (12 or 13 digit number), always capture it in the upc field regardless of what is in the item number column. If the rawItemRef itself is a 12 or 13 digit UPC, also populate the upc field with it. If no UPC is present anywhere in the row, set upc to null.\n- Merge duplicate rawItemRef rows by summing qtyOnHand.\n- The Acme item number may appear in columns named MFG_SKU, SKU, Item Number, Item #, Model, Part Number, MFR Model #, Mfg Part #, Style, PRODUCT_NUMBER, or similar. When multiple identifier columns exist, examine the actual values in each column and use the one whose values match known Acme SKU patterns as rawItemRef and mfrItemNumber.\n- The quantity on hand may appear in columns named QTYOH, QOH, Qty On Hand, Quantity on Hand, On Hand, QTY, Stock, TQOH, QAS, Available, Availability, Qty Available, Inv, Inventory, or similar. It will always be a numeric column representing stock quantities. Always identify and extract it. Never return null for qtyOnHand if a numeric quantity column exists in the data.\n- If a rawItemRef value is \"false\", \"true\", \"null\", \"undefined\", or any boolean/null literal string, skip it entirely. Do not include it in output.\n- If a rawItemRef value is a 12 or 13 digit number it is a UPC. Set mfrItemNumber to null and populate the upc field with it.\n- SKIP any rawItemRef that contains a space. Valid Acme SKUs never contain spaces. Values like \"2 CYLINDERS\" or \"SMALL STEEL\" are category labels, not SKUs.\n- SKIP any rawItemRef that is fewer than 5 characters. Valid Acme SKUs are always at least 5 characters long. Values like \"R92\" or \"BR\" are category labels, not SKUs.\n- Acme SKU variants often include color, finish, or edition suffixes appended to the base SKU (for example -BK, -NI, -CH, -GLD). These are still valid Acme SKUs.\n\nNON-STANDARD FILE LAYOUTS:\nSome customer files contain summary rows, metadata, formula cells, or blank rows before the actual inventory data begins. Apply these rules:\n- SKIP any row where the SKU/part number field is empty, blank, or contains non-SKU text such as labels (e.g. \"Cost Value:\", \"YTD Sales:\", \"MFG:\"), formula strings (e.g. \"=SUM(...)\"), or summary descriptions.\n- SKIP any row where every meaningful field is null or empty.\n- A valid inventory row must have a non-empty SKU or part number value. Quantity on hand may be 0 or null. That is acceptable as long as the SKU is present.\n- DO NOT include summary totals, subtotals, or grand total rows as inventory items.\n\nReturn exactly this compact JSON structure:\n{\"items\":[{\"rawItemRef\":\"<string>\",\"mfrItemNumber\":\"<string or null>\",\"qtyOnHand\":<number or null>,\"upc\":\"<12 or 13 digit string, or null>\"}]}`;\n\n// ── BUILD ONE OUTPUT ITEM PER CHUNK ────────────────────────────────────────\nconst outputItems = rowChunks.map((chunkRows, chunkIdx) => {\n  const csvLines = [headers.join(',')];\n  chunkRows.forEach(row => {\n    const line = headers.map(h => csvVal(row[h])).join(',');\n    csvLines.push(line);\n  });\n  const csvContent = csvLines.join('\\n');\n  const MAX_CHARS = 80000;\n  const truncated = csvContent.length > MAX_CHARS;\n  const contentForPrompt = truncated ? csvContent.substring(0, MAX_CHARS) + '\\n[TRUNCATED]' : csvContent;\n\n  const userPrompt = totalChunks > 1\n    ? `Extract all inventory line items from the following CSV data submitted by a Acme customer.\nSender: ${item.senderEmail}\nSubject: ${item.subject}\nChunk: ${chunkIdx + 1} of ${totalChunks}\nRows in this chunk: ${chunkRows.length}${truncated ? ' (TRUNCATED)' : ''}\n--- CONTENT START ---\n${contentForPrompt}\n--- CONTENT END ---\nReturn ONLY compact JSON. No other text.`\n    : `Extract all inventory line items from the following CSV data submitted by a Acme customer.\nSender: ${item.senderEmail}\nSubject: ${item.subject}\nRows: ${chunkRows.length}${truncated ? ' (TRUNCATED)' : ''}\n--- CONTENT START ---\n${contentForPrompt}\n--- CONTENT END ---\nReturn ONLY compact JSON. No other text.`;\n\n  return {\n    json: {\n      ...item,\n      customerId: customerId,\n      chunkIndex: chunkIdx,\n      totalChunks: totalChunks,\n      qtyLookup: qtyLookup,\n      qtyLookupMeta: { qtyCol, itemIdCol },\n      apiMessages: [{ role: 'user', content: userPrompt }],\n      apiSystemPrompt: [\n        {\n          type: 'text',\n          text: systemPrompt,\n          cache_control: { type: 'ephemeral' }\n        }\n      ]\n    }\n  };\n});\n\nreturn outputItems;"
+      },
+      "id": "3c7e7078-db66-41ae-bdbf-ca3c431d40d6",
+      "name": "Build AI Parser Prompt",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -2112,
+        240
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.anthropic.com/v1/messages",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "anthropic-version",
+              "value": "2023-06-01"
+            },
+            {
+              "name": "content-type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ {\n  \"model\": \"claude-sonnet-5-5\",\n  \"max_tokens\": 32000,\n  \"stream\": false,\n  \"system\": $json.apiSystemPrompt,\n  \"messages\": $json.apiMessages\n} }}",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "json"
+            }
+          },
+          "timeout": 600000
+        }
+      },
+      "id": "373ed9a2-6d57-489a-b37e-d4f809281973",
+      "name": "Call Claude API (Parser)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        -1888,
+        240
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE_ME",
+          "name": "LLM API Header Auth"
+        }
+      },
+      "notes": "SETUP: Create an HTTP Header Auth credential named 'Anthropic API Key'. Header name: x-api-key. Value: your Anthropic API key. Model: claude-sonnet-4-20250514 is recommended for production. Use claude-haiku-4-5-20251001 for cost savings during testing."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const item = $input.item.json;\nconst today = new Date().toISOString().split('T')[0];\nconst customerId = $('Build AI Parser Prompt').item.json.customerId ?? null;\nconst qtyLookup = $('Build AI Parser Prompt').item.json.qtyLookup ?? {};\nconst chunkIndex = $('Build AI Parser Prompt').item.json.chunkIndex ?? 0;\nconst totalChunks = $('Build AI Parser Prompt').item.json.totalChunks ?? 1;\nconst outlookTrigger = $('Microsoft Outlook Trigger').item.json;\nconst senderEmail = outlookTrigger.from?.emailAddress?.address ?? null;\nconst senderName = outlookTrigger.from?.emailAddress?.name ?? null;\nconst subject = outlookTrigger.subject ?? null;\nconst receivedAt = outlookTrigger.receivedDateTime ?? null;\nconst workflowRunId = $('Build AI Parser Prompt').item.json.workflowRunId ?? null;\nlet claudeText = '';\ntry {\n  const content = item.content ?? [];\n  claudeText = content\n    .filter(c => c.type === 'text')\n    .map(c => c.text)\n    .join('')\n    .trim();\n} catch(e) {\n  throw new Error('Stage 1 FATAL: Could not read Claude API response content. Raw: ' + JSON.stringify(item).substring(0, 500));\n}\n\nlet parsed = null;\ntry {\n  const cleaned = claudeText\n    .replace(/^```json\\s*/i, '')\n    .replace(/^```\\s*/i, '')\n    .replace(/\\s*```$/i, '')\n    .trim();\n  parsed = JSON.parse(cleaned);\n} catch(e) {\n  throw new Error(`Stage 1 FATAL: Claude response was not valid JSON (chunk ${chunkIndex + 1} of ${totalChunks}). Response preview: ` + claudeText.substring(0, 300));\n}\n\nif (!parsed.items || !Array.isArray(parsed.items)) {\n  throw new Error(`Stage 1 FATAL: Claude response missing items array (chunk ${chunkIndex + 1} of ${totalChunks}).`);\n}\nif (parsed.items.length === 0) {\n  throw new Error(`Stage 1 FATAL: Claude returned zero items (chunk ${chunkIndex + 1} of ${totalChunks}).`);\n}\n\nconst CONFIDENCE_THRESHOLD = 0.75;\nconst warnings = [];\nconst mergedItems = new Map();\n\nfor (const rawItem of parsed.items) {\n  if (!rawItem.rawItemRef) {\n    warnings.push('Item missing rawItemRef — skipping');\n    continue;\n  }\n\n  if (typeof rawItem.qtyOnHand === 'string') {\n    rawItem.qtyOnHand = parseFloat(rawItem.qtyOnHand.replace(/[^0-9.]/g, '')) || null;\n  }\n\n  let itemRefType = 'customer-sku';\n  if (rawItem.mfrItemNumber) {\n    const sku = rawItem.mfrItemNumber.toUpperCase();\n    if (/^(BR|BX)/.test(sku)) itemRefType = 'brand-b-sku';\n    else if (/^CH/.test(sku)) itemRefType = 'brand-c-sku';\n    else if (/^\\d{3}-\\d{4}-\\d{2}$/.test(sku)) itemRefType = 'brand-a-sku';\n    else itemRefType = 'brand-a-sku';\n  } else if (/^\\d{12,13}$/.test(rawItem.rawItemRef.replace(/\\s/g, ''))) {\n    itemRefType = 'upc';\n  }\n\n  const itemResolved = rawItem.mfrItemNumber !== null && rawItem.mfrItemNumber !== undefined;\n  const resolutionConfidence = itemResolved ? 0.95 : 0.0;\n  const resolutionSource = itemResolved ? 'ai-direct' : null;\n\n  if (resolutionConfidence < CONFIDENCE_THRESHOLD && itemResolved) {\n    rawItem.mfrItemNumber = null;\n    warnings.push(rawItem.rawItemRef + ': low confidence — flagged for manual review');\n  }\n\n  const lookupKey = rawItem.rawItemRef.trim().toUpperCase();\n  const lookedUpQty = qtyLookup[lookupKey];\n  const finalQty = lookedUpQty !== undefined ? lookedUpQty : (rawItem.qtyOnHand ?? null);\n\n  const fullItem = {\n    lineNumber: 0,\n    rawItemRef: rawItem.rawItemRef,\n    itemRefType,\n    mfrItemNumber: rawItem.mfrItemNumber ?? null,\n    upc: rawItem.upc ?? (itemRefType === 'upc' ? rawItem.rawItemRef : null),\n    customerPartNum: itemRefType === 'customer-sku' ? rawItem.rawItemRef : null,\n    qtyOnHand: finalQty,\n    uom: 'EA',\n    itemResolved,\n    resolutionSource,\n    resolutionConfidence,\n    parseNotes: null\n  };\n\n  const key = rawItem.rawItemRef.trim().toUpperCase();\n  if (mergedItems.has(key)) {\n    const existing = mergedItems.get(key);\n    const combinedQty = (existing.qtyOnHand ?? 0) + (fullItem.qtyOnHand ?? 0);\n    existing.qtyOnHand = combinedQty;\n    existing.parseNotes = 'Merged duplicate — summed qtyOnHand = ' + combinedQty;\n    warnings.push(rawItem.rawItemRef + ': duplicate merged');\n  } else {\n    mergedItems.set(key, fullItem);\n  }\n}\n\nconst finalItems = Array.from(mergedItems.values());\nfinalItems.forEach((it, idx) => { it.lineNumber = idx + 1; });\n\nconst resolvedCount = finalItems.filter(it => it.itemResolved).length;\nconst parseConfidence = finalItems.length > 0\n  ? Math.round((resolvedCount / finalItems.length) * 100) / 100\n  : 0;\n\nconst manualReviewItems = finalItems.filter(it => !it.itemResolved);\nconst needsManualReview = manualReviewItems.length > 0;\n\nconst workingObject = {\n  envelope: {\n    senderEmail:     senderEmail,\n    senderName:      senderName,\n    subject:         subject,\n    receivedAt:      receivedAt,\n    attachmentName:  item.attachmentName,\n    attachmentType:  item.attachmentType,\n    rawContent:      null,\n    parseMethod:     'ai-claude',\n    parseConfidence,\n    workflowRunId:   workflowRunId,\n    customerId:      customerId\n  },\n  customer:         null,\n  items:            finalItems,\n  openOrders:       [],\n  availability:     [],\n  topItems:         [],\n  comparison:       null,\n  salesHistory:     null,\n  aiRecommendation: null,\n  _meta: {\n    stage1CompletedAt:    new Date().toISOString(),\n    itemCount:            finalItems.length,\n    reportDate:           today,\n    manualReviewRequired: needsManualReview,\n    manualReviewCount:    manualReviewItems.length,\n    warnings:             warnings,\n    processingNotes:      warnings.length > 0 ? warnings.join(' | ') : null,\n    chunkIndex,\n    totalChunks\n  }\n};\n\nreturn { json: workingObject };"
+      },
+      "id": "1238effb-c952-4e50-9c75-da8d1215da55",
+      "name": "Parse & Validate API Response",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -1664,
+        240
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 1
+          },
+          "conditions": [
+            {
+              "id": "cond-manual-review",
+              "leftValue": "={{ $json._meta.manualReviewRequired }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "a845f85b-93bb-4b7b-92bc-b39151975a96",
+      "name": "Any Manual Review Items?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        128,
+        144
+      ]
+    },
+    {
+      "parameters": {
+        "fromEmail": "user@example.com",
+        "toEmail": "=user@example.com,{{ $('Microsoft Outlook Trigger').item.json.from.emailAddress.address }}",
+        "subject": "={{ '[Inventory] Manual Review Required — ' + $json.envelope.senderEmail + ' — Run: ' + $json.envelope.workflowRunId }}",
+        "emailFormat": "html",
+        "html": "=={{ '<div style=\"font-family:Arial;font-size:14px;color:#333;max-width:700px;\"><div style=\"background-color:#1F3A5F;padding:20px 30px;\"><h1 style=\"color:#fff;margin:0;font-size:20px;\">ACME MANUFACTURING</h1><p style=\"color:#fff;margin:4px 0 0;font-size:13px;\">Inventory Manual Review Required</p></div><div style=\"padding:20px 30px;background:#F5F4F2;\"><h2 style=\"color:#8A8A8A;font-size:16px;margin-top:0;\">Submission Details</h2><table style=\"border-collapse:collapse;width:100%;font-size:14px;\"><tr style=\"background:#fff;\"><td style=\"padding:8px 12px;font-weight:bold;width:180px;\">From</td><td style=\"padding:8px 12px;\">' + $json.envelope.senderEmail + '</td></tr><tr style=\"background:#F5F4F2;\"><td style=\"padding:8px 12px;font-weight:bold;\">Sender Name</td><td style=\"padding:8px 12px;\">' + $json.envelope.senderName + '</td></tr><tr style=\"background:#fff;\"><td style=\"padding:8px 12px;font-weight:bold;\">Subject</td><td style=\"padding:8px 12px;\">' + $json.envelope.subject + '</td></tr><tr style=\"background:#F5F4F2;\"><td style=\"padding:8px 12px;font-weight:bold;\">Received</td><td style=\"padding:8px 12px;\">' + $json.envelope.receivedAt + '</td></tr><tr style=\"background:#fff;\"><td style=\"padding:8px 12px;font-weight:bold;\">Customer ID</td><td style=\"padding:8px 12px;\">' + $json.envelope.customerId + '</td></tr><tr style=\"background:#F5F4F2;\"><td style=\"padding:8px 12px;font-weight:bold;\">Total Items</td><td style=\"padding:8px 12px;\">' + $json._meta.itemCount + '</td></tr><tr style=\"background:#fff;\"><td style=\"padding:8px 12px;font-weight:bold;\">Items Needing Review</td><td style=\"padding:8px 12px;color:#1F3A5F;font-weight:bold;\">' + $json._meta.manualReviewCount + '</td></tr><tr style=\"background:#F5F4F2;\"><td style=\"padding:8px 12px;font-weight:bold;\">Run ID</td><td style=\"padding:8px 12px;font-size:11px;\">' + $json.envelope.workflowRunId + '</td></tr></table></div><div style=\"padding:20px 30px;background:#fff;\"><h2 style=\"color:#8A8A8A;font-size:16px;\">Items Requiring Review</h2><table style=\"border-collapse:collapse;width:100%;font-size:13px;\"><tr style=\"background:#1A1A1A;color:#fff;\"><td style=\"padding:8px 12px;\">Line</td><td style=\"padding:8px 12px;\">Raw Item Ref</td><td style=\"padding:8px 12px;\">Type</td><td style=\"padding:8px 12px;\">Qty</td><td style=\"padding:8px 12px;\">Confidence</td><td style=\"padding:8px 12px;\">Notes</td></tr>' + $json.items.filter(i => !i.itemResolved && (i.resolutionConfidence ?? 0) < 0.75).map((i, idx) => '<tr style=\"background:' + (idx % 2 === 0 ? \"#fff\" : \"#F5F4F2\") + ';\"><td style=\"padding:8px 12px;\">' + i.lineNumber + '</td><td style=\"padding:8px 12px;font-weight:bold;\">' + i.rawItemRef + '</td><td style=\"padding:8px 12px;\">' + i.itemRefType + '</td><td style=\"padding:8px 12px;\">' + (i.qtyOnHand ?? \"N/A\") + \" \" + i.uom + '</td><td style=\"padding:8px 12px;color:#1F3A5F;\">' + i.resolutionConfidence + '</td><td style=\"padding:8px 12px;\">' + (i.parseNotes ?? \"—\") + '</td></tr>').join(\"\") + '</table><p style=\"font-size:12px;color:#6E6E6E;margin-top:20px;\">All auto-resolved items have continued to Stage 2 processing. Please review the items above and update customer-SKU mappings in SAC where applicable.</p></div><div style=\"padding:10px 30px;background:#1A1A1A;\"><p style=\"color:#888;font-size:11px;margin:0;\">This is an automated message from the Acme Intelligent Inventory System. Do not reply to this email.</p></div></div>' }}",
+        "options": {}
+      },
+      "id": "dd99fe61-f237-453c-ab9f-81779aaf6176",
+      "name": "Send Manual Review Notification",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2,
+      "position": [
+        352,
+        144
+      ],
+      "executeOnce": true,
+      "credentials": {
+        "smtp": {
+          "id": "REPLACE_ME",
+          "name": "SMTP account"
+        }
+      },
+      "notes": "SETUP: Create an SMTP credential for your outbound mail server. Update fromEmail and toEmail to match your environment. The ops team will receive a formatted HTML table of all items that could not be auto-resolved."
+    },
+    {
+      "parameters": {
+        "mode": "raw",
+        "options": {}
+      },
+      "id": "4c73cd6a-547f-4ff6-9bad-e5fc5f7b4226",
+      "name": "Stage 1 Complete — Output",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3,
+      "position": [
+        128,
+        336
+      ],
+      "notes": "Connect output of this node to the Stage 2 workflow trigger (Execute Workflow or webhook). The full working object in $json is ready for Stage 2 customer resolution. Key fields Stage 2 needs: envelope.senderEmail, envelope.senderName, items[].rawItemRef, items[].itemRefType, items[].upc, items[].customerPartNum"
+    },
+    {
+      "parameters": {
+        "fromEmail": "user@example.com",
+        "toEmail": "=user@example.com, {{ $('Microsoft Outlook Trigger').item.json.from.emailAddress.address }}",
+        "subject": "=Fatal Failure Invalid Sender Email - {{$now.format('yyyy-MM-dd')}}",
+        "html": "=={{ '<h2 style=\"color:#1F3A5F;font-family:Arial;\">Workflow — FATAL Error</h2><table style=\"font-family:Arial;font-size:14px;border-collapse:collapse;width:100%\"><tr style=\"background:#f5f4f2;\"><td style=\"padding:8px;font-weight:bold;width:160px;\">Error Type</td><td style=\"padding:8px;\">' + $json.errorType + '</td></tr><tr><td style=\"padding:8px;font-weight:bold;\">Message</td><td style=\"padding:8px;\">' + $json.errorMessage + '</td></tr><tr style=\"background:#f5f4f2;\"><td style=\"padding:8px;font-weight:bold;\">From</td><td style=\"padding:8px;\">' + $json.senderEmail + '</td></tr><tr><td style=\"padding:8px;font-weight:bold;\">Sender Name</td><td style=\"padding:8px;\">' + $json.senderName + '</td></tr><tr style=\"background:#f5f4f2;\"><td style=\"padding:8px;font-weight:bold;\">Subject</td><td style=\"padding:8px;\">' + $json.subject + '</td></tr><tr><td style=\"padding:8px;font-weight:bold;\">Received</td><td style=\"padding:8px;\">' + $json.receivedAt + '</td></tr><tr style=\"background:#f5f4f2;\"><td style=\"padding:8px;font-weight:bold;\">Run ID</td><td style=\"padding:8px;\">' + $json.workflowRunId + '</td></tr></table><p style=\"font-family:Arial;font-size:12px;color:#6E6E6E;\">This is an automated notification from the Acme Intelligent Inventory Recommendation System.</p>' }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [
+        -1664,
+        432
+      ],
+      "id": "a2c37484-0ade-42dc-a850-375d7971590d",
+      "name": "Send an Email",
+      "retryOnFail": true,
+      "waitBetweenTries": 5000,
+      "executeOnce": true,
+      "credentials": {
+        "smtp": {
+          "id": "REPLACE_ME",
+          "name": "SMTP account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "pollTimes": {
+          "item": [
+            {
+              "mode": "everyMinute"
+            }
+          ]
+        },
+        "output": "raw",
+        "filters": {
+          "foldersToInclude": [
+            "REPLACE_WITH_FOLDER_ID"
+          ]
+        },
+        "options": {
+          "downloadAttachments": true
+        }
+      },
+      "type": "n8n-nodes-base.microsoftOutlookTrigger",
+      "typeVersion": 1,
+      "position": [
+        -4128,
+        432
+      ],
+      "id": "6c22be74-4643-4f22-9f21-c8f98c56c60d",
+      "name": "Microsoft Outlook Trigger",
+      "credentials": {
+        "microsoftOutlookOAuth2Api": {
+          "id": "REPLACE_ME",
+          "name": "Outlook account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "xlsx",
+        "binaryPropertyName": "inventory_file",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.extractFromFile",
+      "typeVersion": 1.1,
+      "position": [
+        -3456,
+        144
+      ],
+      "id": "8fd39d8b-dea5-45f6-92cf-72f6f5197a07",
+      "name": "Extract from File"
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "leftValue": "=={{ Object.values($binary).find(a => a.mimeType?.includes('spreadsheetml') || ((a.mimeType || '').includes('octet-stream') && (a.fileName || '').toLowerCase().endsWith('.xlsx'))) ? 'spreadsheetml' : '' }}",
+                    "rightValue": "spreadsheetml",
+                    "operator": {
+                      "type": "string",
+                      "operation": "contains"
+                    },
+                    "id": "758155d8-6965-4c6b-87a0-4254c05fb063"
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "xlsx"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "id": "7be84626-a3a4-4264-88b4-230acba51f04",
+                    "leftValue": "=={{ Object.values($binary).find(a => a.mimeType?.includes('ms-excel') || ((a.mimeType || '').includes('octet-stream') && (a.fileName || '').toLowerCase().endsWith('.xls') && !(a.fileName || '').toLowerCase().endsWith('.xlsx'))) ? 'ms-excel' : '' }}",
+                    "rightValue": "ms-excel",
+                    "operator": {
+                      "type": "string",
+                      "operation": "contains"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "xls"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "id": "b8c1634f-3472-4d38-a9d5-51e132781d6e",
+                    "leftValue": "=={{ Object.values($binary).find(a => a.mimeType?.includes('csv') || ((a.mimeType || '').includes('octet-stream') && (a.fileName || '').toLowerCase().endsWith('.csv'))) ? 'csv' : '' }}",
+                    "rightValue": "csv",
+                    "operator": {
+                      "type": "string",
+                      "operation": "contains"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "csv"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "id": "225e1b4f-3a3a-4387-9ea8-478481dc9928",
+                    "leftValue": "=={{ Object.values($binary).find(a => a.mimeType?.includes('pdf') || ((a.mimeType || '').includes('octet-stream') && (a.fileName || '').toLowerCase().endsWith('.pdf'))) ? 'pdf' : '' }} }}",
+                    "rightValue": "pdf",
+                    "operator": {
+                      "type": "string",
+                      "operation": "contains"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "pdf"
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "none"
+        }
+      },
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.4,
+      "position": [
+        -3904,
+        400
+      ],
+      "id": "c8f48bbf-12ca-4137-b6b9-46f0eb4a9d28",
+      "name": "Route by File Type"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Search across all items for the inventory binary attachment\n// (handles emails with multiple attachments e.g. signature images)\nconst allItems = $input.all();\nlet inventoryBinaryKey = null;\nlet binary = null;\nlet matchedItem = null;\n\nfor (const it of allItems) {\n  const b = it.binary ?? {};\n  const key = Object.keys(b).find(k =>\n    (b[k].mimeType || '').includes('spreadsheetml') ||\n    (b[k].mimeType || '').includes('excel') ||\n    (b[k].mimeType || '').includes('csv') ||\n    (b[k].mimeType || '').includes('pdf') ||\n    ((b[k].mimeType || '').includes('octet-stream') && (\n      (b[k].fileName || '').toLowerCase().endsWith('.xlsx') ||\n      (b[k].fileName || '').toLowerCase().endsWith('.xls') ||\n      (b[k].fileName || '').toLowerCase().endsWith('.csv') ||\n      (b[k].fileName || '').toLowerCase().endsWith('.pdf')\n    ))\n  );\n  if (key) {\n    inventoryBinaryKey = key;\n    binary = b;\n    matchedItem = it;\n    break;\n  }\n}\n\nif (!inventoryBinaryKey) {\n  throw new Error('Stage 1 FATAL: No inventory attachment found in email.');\n}\n\nreturn {\n  json: {\n    ...matchedItem.json,\n    inventoryBinaryKey: inventoryBinaryKey,\n    attachmentName: binary[inventoryBinaryKey].fileName,\n    attachmentType: binary[inventoryBinaryKey].mimeType\n  },\n  binary: {\n    inventory_file: binary[inventoryBinaryKey]\n  }\n};"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -3680,
+        144
+      ],
+      "id": "ec190eea-36ac-4416-b4f7-4c1619d7dc5b",
+      "name": "Code in JavaScript"
+    },
+    {
+      "parameters": {
+        "aggregate": "aggregateAllItemData",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.aggregate",
+      "typeVersion": 1,
+      "position": [
+        -1888,
+        432
+      ],
+      "id": "d8ddf49f-6096-4808-837c-fb5e1671d4c5",
+      "name": "Aggregate"
+    },
+    {
+      "parameters": {
+        "operation": "xls",
+        "binaryPropertyName": "inventory_file",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.extractFromFile",
+      "typeVersion": 1.1,
+      "position": [
+        -3456,
+        336
+      ],
+      "id": "656eaf0a-4179-464c-b583-c097efe16232",
+      "name": "Extract from File1"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const binary = $input.item.binary || {};\nconst inventoryBinaryKey = Object.keys(binary).find(k =>\n  (binary[k].mimeType || '').includes('spreadsheetml') ||\n  (binary[k].mimeType || '').includes('excel') ||\n  (binary[k].mimeType || '').includes('csv') ||\n  (binary[k].mimeType || '').includes('pdf') ||\n  ((binary[k].mimeType || '').includes('octet-stream') && (\n    (binary[k].fileName || '').toLowerCase().endsWith('.xlsx') ||\n    (binary[k].fileName || '').toLowerCase().endsWith('.xls') ||\n    (binary[k].fileName || '').toLowerCase().endsWith('.csv') ||\n    (binary[k].fileName || '').toLowerCase().endsWith('.pdf')\n  ))\n);\nif (!inventoryBinaryKey) {\n  throw new Error('Stage 1 FATAL: No inventory attachment found in email.');\n}\nreturn {\n  json: {\n    ...$input.item.json,\n    inventoryBinaryKey: inventoryBinaryKey,\n    attachmentName: binary[inventoryBinaryKey].fileName,\n    attachmentType: binary[inventoryBinaryKey].mimeType\n  },\n  binary: {\n    inventory_file: binary[inventoryBinaryKey]\n  }\n};"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -3680,
+        336
+      ],
+      "id": "fb99d58b-ece8-4406-a9c6-86007e39c0ee",
+      "name": "Code in JavaScript1"
+    },
+    {
+      "parameters": {
+        "aggregate": "aggregateAllItemData",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.aggregate",
+      "typeVersion": 1,
+      "position": [
+        -3232,
+        144
+      ],
+      "id": "84295c4e-2ea5-4f35-94c6-a638f78ab6be",
+      "name": "Aggregate XLSX"
+    },
+    {
+      "parameters": {
+        "aggregate": "aggregateAllItemData",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.aggregate",
+      "typeVersion": 1,
+      "position": [
+        -3232,
+        336
+      ],
+      "id": "f8083515-f4be-42ed-9a4e-8d34c1649857",
+      "name": "Aggregate XLS"
+    },
+    {
+      "parameters": {
+        "binaryPropertyName": "inventory_file",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.extractFromFile",
+      "typeVersion": 1.1,
+      "position": [
+        -3456,
+        528
+      ],
+      "id": "f0f1bef6-ab3b-4e27-a8a7-6b1373b58b1b",
+      "name": "Extract from File2"
+    },
+    {
+      "parameters": {
+        "jsCode": "const binary = $input.item.binary || {};\nconst inventoryBinaryKey = Object.keys(binary).find(k =>\n  (binary[k].mimeType || '').includes('spreadsheetml') ||\n  (binary[k].mimeType || '').includes('excel') ||\n  (binary[k].mimeType || '').includes('csv') ||\n  (binary[k].mimeType || '').includes('pdf') ||\n  (binary[k].mimeType || '').includes('octet-stream') && (\n    (binary[k].fileName || '').toLowerCase().endsWith('.xlsx') ||\n    (binary[k].fileName || '').toLowerCase().endsWith('.xls') ||\n    (binary[k].fileName || '').toLowerCase().endsWith('.csv') ||\n    (binary[k].fileName || '').toLowerCase().endsWith('.pdf')\n  )\n);\nif (!inventoryBinaryKey) {\n  throw new Error('Stage 1 FATAL: No inventory attachment found in email.');\n}\n\nlet attachmentBinary = binary[inventoryBinaryKey];\n\n// Helpers for CSV table detection (quote-aware)\nfunction splitRecords(text) {\n  const records = [];\n  let cur = '';\n  let inQuotes = false;\n  for (let i = 0; i < text.length; i++) {\n    const ch = text[i];\n    if (ch === '\"') {\n      inQuotes = !inQuotes;\n      cur += ch;\n    } else if (ch === '\\n' && !inQuotes) {\n      records.push(cur);\n      cur = '';\n    } else {\n      cur += ch;\n    }\n  }\n  records.push(cur);\n  return records.filter(r => r.trim() !== '');\n}\n\nfunction countFields(record) {\n  let n = 1;\n  let inQuotes = false;\n  for (let i = 0; i < record.length; i++) {\n    const ch = record[i];\n    if (ch === '\"') inQuotes = !inQuotes;\n    else if (ch === ',' && !inQuotes) n++;\n  }\n  return n;\n}\n\n// Fix for malformed source files (seen in a distributor/agency exports like\n// KB0040103313204w.csv) where every row is terminated with a doubled\n// carriage return (\\r\\r\\n) instead of a normal line ending. This confuses\n// the downstream CSV parser's newline auto-detection -- it starts\n// treating a lone \\r as the row separator, which splits real rows in\n// half and eventually throws \"Invalid Opening Quote\" when it hits a\n// quote character right after a stray leftover \\n. Fix: collapse\n// \\r\\r\\n -> \\n, then normalize any remaining \\r\\n or lone \\r the same\n// way, before the CSV extraction node ever sees the file.\n//\n// Additionally (added 2026-09-29): some agency CSVs (e.g. the weekly SMGA\n// report) carry a variable number of title/banner lines above the real\n// header row, and sometimes footer lines below the table. csv-parse\n// enforces one uniform record width, so those lines make Extract from File\n// throw \"Invalid Record Length\". XLSX/XLS files don't hit this because\n// SheetJS tolerates ragged rows and Build AI Parser Prompt's smart header\n// detection repairs the header. For CSVs we trim instead: the table width is\n// the most common field count, and only records from the first to the last\n// record of that width are kept.\nconst isCsv = (attachmentBinary.mimeType || '').includes('csv') ||\n  (attachmentBinary.fileName || '').toLowerCase().endsWith('.csv');\n\nif (isCsv) {\n  const buffer = await this.helpers.getBinaryDataBuffer($itemIndex, inventoryBinaryKey);\n  let text = buffer.toString('latin1'); // latin1 preserves byte values 1:1, safe for re-encoding\n\n  text = text\n    .replace(/^\\u00EF\\u00BB\\u00BF/, '') // UTF-8 BOM as seen through latin1\n    .replace(/\\r\\r\\n/g, '\\n')\n    .replace(/\\r\\n/g, '\\n')\n    .replace(/\\r/g, '\\n');\n\n  const records = splitRecords(text);\n  if (records.length === 0) {\n    throw new Error('Stage 1 FATAL: CSV attachment contains no non-empty records.');\n  }\n\n  const counts = records.map(countFields);\n\n  // Modal field count (ties resolve to the wider count)\n  const freq = {};\n  counts.forEach(c => { freq[c] = (freq[c] || 0) + 1; });\n  let width = 0;\n  let best = -1;\n  for (const [c, f] of Object.entries(freq)) {\n    const cn = Number(c);\n    if (f > best || (f === best && cn > width)) {\n      best = f;\n      width = cn;\n    }\n  }\n\n  const first = counts.findIndex(c => c === width);\n  let last = -1;\n  for (let k = counts.length - 1; k >= 0; k--) {\n    if (counts[k] === width) { last = k; break; }\n  }\n\n  // Any record inside the table body with the wrong width -> fail loudly with detail\n  const bad = [];\n  for (let k = first; k <= last; k++) {\n    if (counts[k] !== width) {\n      bad.push({ record: k + 1, fields: counts[k], text: records[k].slice(0, 200) });\n    }\n  }\n  if (bad.length > 0) {\n    throw new Error(\n      'Stage 1 FATAL: CSV table width is ' + width + ' fields but ' + bad.length +\n      ' record(s) inside the table differ. First 5: ' + JSON.stringify(bad.slice(0, 5))\n    );\n  }\n\n  const cleaned = records.slice(first, last + 1).join('\\n') + '\\n';\n\n  attachmentBinary = await this.helpers.prepareBinaryData(\n    Buffer.from(cleaned, 'latin1'),\n    attachmentBinary.fileName,\n    attachmentBinary.mimeType\n  );\n}\n\nreturn {\n  json: {\n    ...$input.item.json,\n    inventoryBinaryKey: inventoryBinaryKey,\n    attachmentName: binary[inventoryBinaryKey].fileName,\n    attachmentType: binary[inventoryBinaryKey].mimeType\n  },\n  binary: {\n    inventory_file: attachmentBinary\n  }\n};"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -3680,
+        528
+      ],
+      "id": "62e4c269-f031-4fac-a361-5ba12c3eab17",
+      "name": "Code in JavaScript2"
+    },
+    {
+      "parameters": {
+        "aggregate": "aggregateAllItemData",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.aggregate",
+      "typeVersion": 1,
+      "position": [
+        -3232,
+        528
+      ],
+      "id": "57a73e7b-afc5-425b-ac4b-7e8c672655e7",
+      "name": "Aggregate CSV"
+    },
+    {
+      "parameters": {
+        "operation": "pdf",
+        "binaryPropertyName": "inventory_file",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.extractFromFile",
+      "typeVersion": 1.1,
+      "position": [
+        -3456,
+        720
+      ],
+      "id": "1766e19e-121b-4b3e-a86b-22b4483431b0",
+      "name": "Extract from File3"
+    },
+    {
+      "parameters": {
+        "jsCode": "const binary = $input.item.binary || {};\n\nconst inventoryBinaryKey = Object.keys(binary).find(k =>\n  (binary[k].mimeType || '').includes('spreadsheetml') ||\n  (binary[k].mimeType || '').includes('excel') ||\n  (binary[k].mimeType || '').includes('csv') ||\n  (binary[k].mimeType || '').includes('pdf') ||\n  ((binary[k].mimeType || '').includes('octet-stream') && (\n    (binary[k].fileName || '').toLowerCase().endsWith('.xlsx') ||\n    (binary[k].fileName || '').toLowerCase().endsWith('.xls') ||\n    (binary[k].fileName || '').toLowerCase().endsWith('.csv') ||\n    (binary[k].fileName || '').toLowerCase().endsWith('.pdf')\n  ))\n);\n\nif (!inventoryBinaryKey) {\n  throw new Error('Stage 1 FATAL: No inventory attachment found in email.');\n}\n\nreturn {\n  json: {\n    ...$input.item.json,\n    inventoryBinaryKey: inventoryBinaryKey,\n    attachmentName: binary[inventoryBinaryKey].fileName,\n    attachmentType: binary[inventoryBinaryKey].mimeType\n  },\n  binary: {\n    inventory_file: binary[inventoryBinaryKey]\n  }\n};"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -3680,
+        720
+      ],
+      "id": "2d92aa33-f089-419e-b5ff-edb7385c04b5",
+      "name": "Code in JavaScript3"
+    },
+    {
+      "parameters": {
+        "aggregate": "aggregateAllItemData",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.aggregate",
+      "typeVersion": 1,
+      "position": [
+        -3232,
+        720
+      ],
+      "id": "4f949e54-cf65-4071-8317-270cd1946f16",
+      "name": "Aggregate PDF"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "fb2eb93f-d984-48d0-8dbd-5cb9c5e14a33",
+              "leftValue": "={{ $json.customerId }}",
+              "rightValue": "==NO_ID",
+              "operator": {
+                "type": "string",
+                "operation": "notEquals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        -2784,
+        432
+      ],
+      "id": "476cf831-2f92-481d-b97c-ebd879a12f5e",
+      "name": "Customer has ID"
+    },
+    {
+      "parameters": {
+        "fromEmail": "user@example.com",
+        "toEmail": "=user@example.com, {{ $('Microsoft Outlook Trigger').item.json.from.emailAddress.address }}",
+        "subject": "=Inventory Submission — Missing or Invalid Account Numberl - {{$now.format('yyyy-MM-dd')}}",
+        "html": "=<div style=\"font-family: Arial, sans-serif; font-size: 14px; color: #333333; max-width: 600px;\">\n  <div style=\"background-color: #1F3A5F; padding: 20px 30px;\">\n    <h1 style=\"color: #FFFFFF; margin: 0; font-size: 20px;\">ACME MANUFACTURING</h1>\n  </div>\n  <div style=\"padding: 30px; background-color: #F5F4F2;\">\n    <p>Dear {{ $('Microsoft Outlook Trigger').item.json.from.emailAddress.name }},</p>\n    <p>Thank you for submitting your inventory to Acme Manufacturing</p>\n    <p>Unfortunately we were unable to process your submission because a valid 7-digit Acme account number was not found in the subject line of your email.</p>\n    <p>Please resubmit your inventory with your account number in the subject line.</p>\n    <p style=\"background-color: #ffffff; padding: 10px 20px; border-left: 4px solid #1F3A5F;\">\n      <strong>Example:</strong> Lipseys 1004441\n    </p>\n    <p>If you need your account number please contact your Acme sales representative.</p>\n    <br>\n    <p>Thank you,<br><strong>Acme Manufacturing</strong><br>Sales Operations</p>\n  </div>\n  <div style=\"padding: 10px 30px; background-color: #1A1A1A;\">\n    <p style=\"color: #888888; font-size: 11px; margin: 0;\">This is an automated message. Please do not reply to this email.</p>\n  </div>\n</div>",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [
+        -2560,
+        528
+      ],
+      "id": "18cb8cfa-f1ca-43f6-a8f9-d453def8c52b",
+      "name": "Send an Email1",
+      "retryOnFail": true,
+      "waitBetweenTries": 5000,
+      "executeOnce": true,
+      "credentials": {
+        "smtp": {
+          "id": "REPLACE_ME",
+          "name": "SMTP account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "workflowId": {
+          "__rl": true,
+          "value": "REPLACE_WITH_WORKFLOW_ID",
+          "mode": "id"
+        },
+        "workflowInputs": {
+          "mappingMode": "defineBelow",
+          "value": {},
+          "matchingColumns": [
+            "customerId"
+          ],
+          "schema": [],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": true
+        },
+        "mode": "each",
+        "options": {
+          "waitForSubWorkflow": true
+        }
+      },
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.3,
+      "position": [
+        352,
+        336
+      ],
+      "id": "3a48e663-233e-4021-a3d9-bf7e9e4baaaa",
+      "name": "Call 'STAGE 2 - SAC Data Retrieval'"
+    },
+    {
+      "parameters": {
+        "fromEmail": "user@example.com",
+        "toEmail": "={{ $('Microsoft Outlook Trigger').item.json.from.emailAddress.address }}",
+        "subject": "=IIRS - Stage 1-8 Data Report - {{ $('Call \\'STAGE 2 - SAC Data Retrieval\\'').item.json.customer.customerId }} - {{$now.format('yyyy-MM-dd')}}",
+        "html": "=<div style=\"font-family: Arial, sans-serif; font-size: 13px; color: #333; max-width: 600px;\">\n  <div style=\"background-color: #1F3A5F; padding: 16px 24px; margin-bottom: 20px;\">\n    <h2 style=\"color: #fff; margin: 0; font-size: 18px;\">ACME MANUFACTURING</h2>\n    <p style=\"color: #fff; margin: 4px 0 0 0; font-size: 12px;\">IIRS Stage 1-8 Data Report</p>\n  </div>\n  <p><strong>{{ $('Call \\'STAGE 2 - SAC Data Retrieval\\'').item.json.customer.customerName }}</strong> &nbsp;|&nbsp; Account: {{ $('Call \\'STAGE 2 - SAC Data Retrieval\\'').item.json.customer.customerId }}</p>\n  <table style=\"width: 100%; border-collapse: collapse; margin: 16px 0;\">\n    <tr>\n      <td style=\"padding: 10px; background: #f5f5f5; border-radius: 4px; text-align: center; width: 20%;\">\n        <div style=\"font-size: 11px; color: #888; text-transform: uppercase;\">Items Submitted</div>\n        <div style=\"font-size: 24px; font-weight: bold; color: #1F3A5F;\">{{ $('Call \\'STAGE 2 - SAC Data Retrieval\\'').item.json.items.length }}</div>\n      </td>\n      <td style=\"width: 2%;\"></td>\n      <td style=\"padding: 10px; background: #f5f5f5; border-radius: 4px; text-align: center; width: 20%;\">\n        <div style=\"font-size: 11px; color: #888; text-transform: uppercase;\">Open Orders</div>\n        <div style=\"font-size: 24px; font-weight: bold; color: #1F3A5F;\">{{ $('Call \\'STAGE 2 - SAC Data Retrieval\\'').item.json._meta.openOrderCount }}</div>\n      </td>\n      <td style=\"width: 2%;\"></td>\n      <td style=\"padding: 10px; background: #f5f5f5; border-radius: 4px; text-align: center; width: 20%;\">\n        <div style=\"font-size: 11px; color: #888; text-transform: uppercase;\">Sales History</div>\n        <div style=\"font-size: 24px; font-weight: bold; color: #1F3A5F;\">{{ $('Call \\'STAGE 2 - SAC Data Retrieval\\'').item.json._meta.salesHistoryCount }}</div>\n      </td>\n      <td style=\"width: 2%;\"></td>\n      <td style=\"padding: 10px; background: #f5f5f5; border-radius: 4px; text-align: center; width: 20%;\">\n        <div style=\"font-size: 11px; color: #888; text-transform: uppercase;\">ATS SKUs</div>\n        <div style=\"font-size: 24px; font-weight: bold; color: #1F3A5F;\">{{ $('Call \\'STAGE 2 - SAC Data Retrieval\\'').item.json._meta.availabilityCount }}</div>\n      </td>\n      <td style=\"width: 2%;\"></td>\n      <td style=\"padding: 10px; background: #f5f5f5; border-radius: 4px; text-align: center; width: 20%;\">\n        <div style=\"font-size: 11px; color: #888; text-transform: uppercase;\">Opportunities</div>\n        <div style=\"font-size: 24px; font-weight: bold; color: #1F3A5F;\">{{ $('Call \\'STAGE 2 - SAC Data Retrieval\\'').item.json._meta.opportunityCount }}</div>\n      </td>\n    </tr>\n  </table>\n  <p style=\"color: #666; font-size: 12px;\">The full report with submitted items sorted by product category is attached as an Excel file. Report generated {{$now.format('yyyy-MM-dd')}}.</p>\n  <p style=\"color: #999; font-size: 11px; border-top: 1px solid #eee; padding-top: 10px; margin-top: 20px;\">This is an automated report from the IIRS system. Please do not reply to this email.</p>\n</div>",
+        "options": {
+          "attachments": "data",
+          "ccEmail": "={{ $('Microsoft Outlook Trigger').item.json.ccRecipients?.map(r => r.emailAddress.address).join(',') }}"
+        }
+      },
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [
+        1248,
+        336
+      ],
+      "id": "719e8221-3d4c-47a1-bc25-9a826b4dc7f6",
+      "name": "Send an Email2",
+      "retryOnFail": true,
+      "waitBetweenTries": 5000,
+      "executeOnce": true,
+      "credentials": {
+        "smtp": {
+          "id": "REPLACE_ME",
+          "name": "SMTP account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "b5d1dcac-fa04-44f2-8104-fadefa3d9de4",
+              "leftValue": "={{ $json.senderAuthorized }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        -2336,
+        336
+      ],
+      "id": "3dd7c217-de91-410c-a42e-9fa27b7069d6",
+      "name": "Sender Authorized"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================\n// VALIDATE SENDER EMAIL — Whitelist Check\n// Stage 1, Node: Validate Sender Email\n// Replace the placeholder entries below with your own authorized senders.\n//\n// To add/remove users: edit the authorizedSenders array below.\n// To deactivate without deleting: set active: false on the entry.\n// ============================================================\n\nconst authorizedSenders = [\n  // --- Internal users (placeholders) ---\n  { email: 'user@example.com',        name: 'Example Admin' },\n  { email: 'user@example.com',      name: 'Example Analyst' },\n\n  // --- Sales reps (placeholders) ---\n  { email: 'user@example.com',      name: 'Example Rep One' },\n  { email: 'user@example.com',      name: 'Example Rep Two' },\n];\n\n// ── Lookup ──────────────────────────────────────────────────\nconst senderEmail = ($('Microsoft Outlook Trigger').item.json\n  .from?.emailAddress?.address ?? '')\n  .toLowerCase()\n  .trim();\n\nconst match = authorizedSenders.find(\n  r => r.email.toLowerCase() === senderEmail\n);\n\n// ── Return ───────────────────────────────────────────────────\n// Merges into the existing envelope object from Initialize Envelope.\n// senderAuthorized drives the true/false branch that already exists.\n// senderName is available for the rejection email body.\nreturn [{\n  json: {\n    ...$('Initialize Envelope').item.json,\n    senderEmail,\n    senderAuthorized: !!match,\n    senderName: match?.name ?? 'Unknown'\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -2560,
+        336
+      ],
+      "id": "4de5b62d-e85e-4a37-84f3-c49f38627190",
+      "name": "Validate Sender Email1"
+    },
+    {
+      "parameters": {
+        "jsCode": "const ExcelJS = require('exceljs');\nconst d = $input.first().json;\nconst aiNarrative      = d.aiNarrative       || '';\nconst availableNow     = d.availableNow       || [];\nconst futureAvail      = d.futureAvailability || [];\nconst meta             = d._meta              || {};\nconst targetWeeksOnHand = d.targetWeeksOnHand ?? 4;\n\nconst MISMATCH_RED  = 'FFFF0000';\nconst BRAND_PRIMARY    = 'FF1F3A5F';\nconst BRAND_ACCENT   = 'FF8A8A8A';\nconst DARK_GRAY     = 'FF333333';\nconst LIGHT_GRAY    = 'FFF0F0F0';\nconst ALT_ROW       = 'FFF9F9F9';\nconst WHITE         = 'FFFFFFFF';\nconst FUTURE_BLUE   = 'FF1F4E79';\nconst NEON_GREEN    = 'FF39FF14';\nconst LIGHT_PINK    = 'FFFFD7D7';\n\nconst workbook = new ExcelJS.Workbook();\nworkbook.creator = 'IIRS - Acme Manufacturing';\nworkbook.created = new Date();\n\nconst summaryItems = d.items.map(item => ({\n  lineNumber:       item.lineNumber,\n  mfrItemNumber: item.mfrItemNumber,\n  rawItemRef:       item.rawItemRef,\n  qtyOnHand:        item.qtyOnHand,\n  customerUpc:      item.upc ?? '',\n  thiUpc:           item.sacData ? item.sacData.upc ?? '' : '',\n  upcMismatch:      item.sacData ? item.sacData.upcMismatch ?? false : false,\n  ats:              item.sacData\n                      ? (item.sacData.qtyAvailableToSell > 0 && item.sacData.qtyAvailableToSell < 10\n                          ? 0\n                          : item.sacData.qtyAvailableToSell)\n                      : null,\n  openOrderQty:     item.sacData ? item.sacData.openOrderQty : 0,\n  earliestDelivery: item.sacData ? item.sacData.earliestDelivery : null,\n  totalShippedQty:  item.sacData ? item.sacData.totalShippedQty : 0,\n  family:           item.sacData ? item.sacData.family : null,\n  mgd2:             item.sacData ? item.sacData.mgd2 : null\n}));\n\n// ── FIX: MGD2/Family values come from a fixed-width SAP field and arrive\n// with trailing whitespace (e.g. \"OTHERS\" + 54 trailing spaces). The old\n// comparator checked `a.mgd2 === 'OTHERS'` which never matched, so the\n// OTHERS/ACCESSO group never got pushed to ZZZZZ and instead sorted\n// alphabetically among real categories. Trim + uppercase before comparing.\nsummaryItems.sort((a, b) => {\n  const mgd2ARaw = (a.mgd2 || '').trim().toUpperCase();\n  const mgd2BRaw = (b.mgd2 || '').trim().toUpperCase();\n  const pushToBottom = (v) => (!v || v === 'OTHERS' || v === 'ACCESSORIES US');\n  const mgd2A = pushToBottom(mgd2ARaw) ? 'ZZZZZ' : mgd2ARaw;\n  const mgd2B = pushToBottom(mgd2BRaw) ? 'ZZZZZ' : mgd2BRaw;\n  if (mgd2A !== mgd2B) return mgd2A.localeCompare(mgd2B);\n\n  const famARaw = (a.family || '').trim().toUpperCase();\n  const famBRaw = (b.family || '').trim().toUpperCase();\n  const famA = (!famARaw || famARaw === 'OTHERS') ? 'ZZZZZ' : famARaw;\n  const famB = (!famBRaw || famBRaw === 'OTHERS') ? 'ZZZZZ' : famBRaw;\n  if (famA !== famB) return famA.localeCompare(famB);\n\n  const matA  = a.mfrItemNumber || a.rawItemRef || '';\n  const matB  = b.mfrItemNumber || b.rawItemRef || '';\n  return matA.localeCompare(matB);\n});\n\n// ── ITEM LOOKUP ───────────────────────────────────────────────────────────\nconst itemLookup = {};\nfor (const item of d.items) {\n  const key = item.mfrItemNumber || item.itemNo || item.material || '';\n  if (!key) continue;\n  itemLookup[key] = {\n    customerQOH:      item.qtyOnHand                ?? 0,\n    totalShipped12mo: item.sacData?.totalShippedQty ?? 0,\n    openOrderQty:     item.sacData?.openOrderQty    ?? 0,\n    upc:              item.sacData?.upc             ?? ''\n  };\n}\nfor (const opp of (d.opportunityItems || [])) {\n  const key = opp.material || '';\n  if (!key || itemLookup[key]) continue;\n  itemLookup[key] = {\n    customerQOH:      0,\n    totalShipped12mo: opp.salesData?.totalShippedQty ?? 0,\n    openOrderQty:     opp.openOrderQty ?? 0,\n    upc:              opp.upc ?? ''\n  };\n}\n\n// ── HELPER: render a recommendation section ───────────────────────────────\nfunction renderRecSection(sheet, lines, sectionTitle, headerColor, isAvailableNow) {\n  const colCount = 16;\n\n  const titleRow = sheet.addRow([]);\n  titleRow.getCell(1).value = sectionTitle;\n  titleRow.height = 22;\n  for (let c = 1; c <= colCount; c++) {\n    titleRow.getCell(c).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: headerColor } };\n  }\n  titleRow.getCell(1).font = { bold: true, color: { argb: WHITE }, name: 'Arial', size: 11 };\n  titleRow.getCell(1).alignment = { vertical: 'middle', indent: 1 };\n\n  if (lines.length === 0) {\n    const emptyRow = sheet.addRow([]);\n    emptyRow.getCell(1).value = 'No items in this category.';\n    emptyRow.getCell(1).font  = { italic: true, name: 'Arial', size: 10, color: { argb: 'FF999999' } };\n    emptyRow.getCell(1).fill  = { type: 'pattern', pattern: 'solid', fgColor: { argb: LIGHT_GRAY } };\n    emptyRow.height = 18;\n    sheet.addRow([]).height = 8;\n    return;\n  }\n\n  let lastSF   = null;\n  let rowIndex = 0;\n\n  lines.forEach(function(line) {\n    const sf = line.subFamily || 'OTHER';\n    if (sf !== lastSF) {\n      const sfRow = sheet.addRow([]);\n      sfRow.getCell(1).value = sf;\n      sfRow.height = 18;\n      for (let c = 1; c <= colCount; c++) {\n        sfRow.getCell(c).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: LIGHT_GRAY } };\n      }\n      sfRow.getCell(1).font = { bold: true, name: 'Arial', size: 10 };\n      sfRow.getCell(1).alignment = { horizontal: 'left', vertical: 'middle', indent: 1 };\n      lastSF = sf;\n    }\n\n    const itemData       = itemLookup[line.itemNo] ?? {};\n    const customerQOH    = itemData.customerQOH     ?? 0;\n    const shipped12mo    = itemData.totalShipped12mo ?? 0;\n    const soldThrough    = Math.max(0, shipped12mo - customerQOH);\n    const weeklyVelocity = soldThrough > 0 ? +(soldThrough / 52).toFixed(2) : 0;\n    const currentWOS     = weeklyVelocity > 0 ? +(customerQOH / weeklyVelocity).toFixed(1) : 0;\n    const targetWOS      = targetWeeksOnHand;\n    const targetQty      = weeklyVelocity > 0 ? Math.ceil(targetWOS * weeklyVelocity) : 0;\n    const onOrderQty     = itemLookup[line.itemNo]?.openOrderQty ?? 0;\n\n    const isUrgent  = isAvailableNow && weeklyVelocity > 10 && currentWOS < 2;\n    const fillColor = isUrgent ? NEON_GREEN : (rowIndex % 2 === 0 ? WHITE : ALT_ROW);\n\n    const row = sheet.addRow([]);\n    row.getCell(1).value  = line.itemNo        || '';\n    row.getCell(2).value  = line.upc || itemLookup[line.itemNo]?.upc || '';\n    row.getCell(3).value  = line.description   || '';\n    row.getCell(4).value  = line.brand         || '';\n    row.getCell(5).value  = line.subFamily     || '';\n    row.getCell(6).value  = line.mgd2          || '';\n    row.getCell(7).value  = Number(line.casePack)       || 0;\n    row.getCell(8).value  = customerQOH;\n    row.getCell(9).value  = weeklyVelocity;\n    row.getCell(10).value = currentWOS;\n    row.getCell(11).value = targetWOS;\n    row.getCell(12).value = targetQty;\n    row.getCell(13).value = onOrderQty;\n    row.getCell(14).value = Number(line.recommendedQty) || 0;\n    row.getCell(15).value = Number(line.netSellPrice)   || 0;\n    row.getCell(16).value = line.rationale     || '';\n    row.height = 18;\n\n    for (let c = 1; c <= colCount; c++) {\n      const cell = row.getCell(c);\n      cell.font  = { name: 'Arial', size: 10 };\n      cell.fill  = { type: 'pattern', pattern: 'solid', fgColor: { argb: fillColor } };\n      cell.border = { bottom: { style: 'hair', color: { argb: 'FFEEEEEE' } } };\n      cell.alignment = { vertical: 'middle' };\n    }\n    row.getCell(7).alignment  = { horizontal: 'center', vertical: 'middle' };\n    row.getCell(8).alignment  = { horizontal: 'center', vertical: 'middle' };\n    row.getCell(9).alignment  = { horizontal: 'center', vertical: 'middle' };\n    row.getCell(9).numFmt     = '0.00';\n    row.getCell(10).alignment = { horizontal: 'center', vertical: 'middle' };\n    row.getCell(10).numFmt    = '0.0';\n    row.getCell(11).alignment = { horizontal: 'center', vertical: 'middle' };\n    row.getCell(12).alignment = { horizontal: 'center', vertical: 'middle' };\n    row.getCell(13).alignment = { horizontal: 'center', vertical: 'middle' };\n    row.getCell(14).alignment = { horizontal: 'center', vertical: 'middle' };\n    row.getCell(15).numFmt    = '\"$\"#,##0.00';\n    row.getCell(15).alignment = { horizontal: 'right',  vertical: 'middle' };\n\n    // Rec. Qty — always gold regardless of row highlight\n    row.getCell(14).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: BRAND_ACCENT } };\n    row.getCell(14).font = { name: 'Arial', size: 10, bold: true, color: { argb: WHITE } };\n\n    // Curr. WOS — always applied even on neon green rows\n   if (currentWOS < 2) {\n      row.getCell(10).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFC00000' } };\n      row.getCell(10).font = { name: 'Arial', size: 10, bold: true, color: { argb: WHITE } };\n    } else if (currentWOS < 5) {\n      row.getCell(10).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFFFC7CE' } };\n      row.getCell(10).font = { name: 'Arial', size: 10, color: { argb: 'FF9C0006' } };\n    }\n\n    // Wkly Vel. — always applied even on neon green rows\n    if (weeklyVelocity > 6) {\n      row.getCell(9).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF375623' } };\n      row.getCell(9).font = { name: 'Arial', size: 10, bold: true, color: { argb: WHITE } };\n    } else if (weeklyVelocity > 2) {\n      row.getCell(9).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFC6EFCE' } };\n      row.getCell(9).font = { name: 'Arial', size: 10, color: { argb: 'FF276221' } };\n    }\n\n    rowIndex++;\n  });\n\n  sheet.addRow([]).height = 8;\n}\n\n// ── SHEET 1: SUMMARY ─────────────────────────────────────────────────────\nconst s1 = workbook.addWorksheet('Summary');\ns1.getColumn(1).width = 28;\ns1.getColumn(2).width = 105;\n\nconst stage2Time = meta.stage2CompletedAt\n  ? new Date(meta.stage2CompletedAt).toLocaleTimeString('en-US', { timeZone: 'America/New_York', hour: '2-digit', minute: '2-digit', second: '2-digit' })\n  : '';\n\nconst s1Data = [\n  { vals: ['ACME MANUFACTURING — IIRS Stage 1-8 Data Report', ''], style: 'title' },\n  { vals: ['Generated', new Date().toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' })], style: 'data' },\n  { vals: ['Requested By', (d.envelope ? d.envelope.senderName || d.envelope.senderEmail : '') || ''], style: 'data' },\n  { vals: ['', ''], style: 'blank' },\n  { vals: ['CUSTOMER INFORMATION', ''], style: 'section' },\n  { vals: ['Customer',  d.customer.customerName], style: 'data' },\n  { vals: ['Account #', String(d.customer.customerId)], style: 'data' },\n  { vals: ['Address',   `${d.customer.street}, ${d.customer.city}, ${d.customer.region} ${d.customer.postalCode}`], style: 'data' },\n  { vals: ['', ''], style: 'blank' },\n  { vals: ['SUMMARY', ''], style: 'section' },\n  { vals: ['Items Submitted',       d.items.length], style: 'data' },\n  { vals: ['Open Orders',           meta.openOrderCount    || 0], style: 'data' },\n  { vals: ['Sales History Records', meta.salesHistoryCount || 0], style: 'data' },\n  { vals: ['ATS SKUs Available',    meta.availabilityCount || 0], style: 'data' },\n  { vals: ['Opportunity Items',     meta.opportunityCount  || 0], style: 'data' },\n  { vals: ['Available Now Items Recommended',   availableNow.length], style: 'data' },\n  { vals: ['Future Availability Items Flagged', futureAvail.length],  style: 'data' },\n  { vals: ['Stage 2 Completed',     stage2Time], style: 'data' },\n  { vals: ['', ''], style: 'blank' },\n  { vals: ['REPORT GUIDE', ''], style: 'section' },\n];\n\ns1Data.forEach((r, i) => {\n  const row = s1.addRow([]);\n  row.getCell(1).value = r.vals[0];\n  row.getCell(2).value = r.vals[1];\n  row.height = 20;\n  if (r.style === 'title') {\n    row.getCell(1).font = { bold: true, size: 13, color: { argb: WHITE }, name: 'Arial' };\n    row.getCell(1).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: BRAND_PRIMARY } };\n    row.getCell(2).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: BRAND_PRIMARY } };\n  } else if (r.style === 'section') {\n    row.getCell(1).font = { bold: true, size: 11, color: { argb: WHITE }, name: 'Arial' };\n    row.getCell(1).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: DARK_GRAY } };\n    row.getCell(2).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: DARK_GRAY } };\n  } else if (r.style === 'data') {\n    const fill = i % 2 === 0 ? WHITE : LIGHT_GRAY;\n    row.getCell(1).font = { bold: true, size: 11, name: 'Arial' };\n    row.getCell(2).font = { size: 11, name: 'Arial' };\n    row.getCell(1).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: fill } };\n    row.getCell(2).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: fill } };\n  }\n});\n\nconst guideItems = [\n  ['Items Submitted',       'Total number of line items the customer submitted in their inventory email.'],\n  ['Open Orders',           'Total number of open or partially shipped sales order line items on file for this customer.'],\n  ['Sales History Records', \"Total number of delivered order line items in this customer's rolling 12M sales history.\"],\n  ['ATS SKUs Available',    'Total number of Acme SKUs currently available to sell across the full product catalog.'],\n  ['Opportunity Items',     'Acme SKUs with available inventory that this customer did not submit — potential cross-sell or reorder opportunities.'],\n  ['Available Now',         'AI-recommended items where Acme has stock available for immediate delivery.'],\n  ['Future Availability',   'AI-recommended items where Acme currently has no stock — includes suggested order qty.'],\n  ['QOH',                   'Quantity on Hand as reported by the customer in their inventory submission.'],\n  ['ATS',                   \"Acme's Available to Sell quantity. 0 = in catalog but out of stock. Values below 10 are suppressed per sales policy.\"],\n  ['Customer UPC',          'UPC code as submitted by the customer in their inventory file.'],\n  ['Acme UPC',               'UPC code on file in Acme product catalog (SAP).'],\n  ['UPC Mismatch',          'Flagged in red when the customer-submitted UPC does not match the Acme catalog UPC.'],\n  ['Open Order Qty',        'Total quantity on open or partially shipped orders for this SKU.'],\n  ['Earliest Delivery',     'Earliest requested delivery date across all open orders for this SKU.'],\n  ['Shipped Qty',           'Total quantity shipped to this customer for this SKU based on rolling 12M sales history.'],\n  ['MGD2',                  'Product category classification (e.g. PISTOLS BR, REVOLVERS BR, LONG GUNS BR).'],\n  ['Family',                'Product sub-family classification within the MGD2 category.'],\n  ['Cust. QOH',             'Customer quantity on hand for this specific SKU, pulled from their inventory submission.'],\n  ['Wkly Vel.',             \"Sell-through weekly velocity: max(0, totalShipped12mo - customerQOH) ÷ 52.\"],\n  ['Curr. WOS',             'Current weeks of supply on hand: Cust. QOH ÷ Weekly Velocity.'],\n  ['Target WOS',            \"Target weeks of supply from this customer's ordering profile.\"],\n  ['Target Qty',            'Target inventory quantity: Target WOS × Weekly Velocity, rounded up.'],\n  ['On Order Qty',          'Quantity already on open sales orders — factored into the recommended order quantity.'],\n];\n\nguideItems.forEach((g, i) => {\n  const row = s1.addRow([]);\n  row.getCell(1).value = g[0];\n  row.getCell(2).value = g[1];\n  row.height = 20;\n  const fill = i % 2 === 0 ? WHITE : LIGHT_GRAY;\n  row.getCell(1).font = { bold: true, size: 10, name: 'Arial' };\n  row.getCell(2).font = { size: 10, name: 'Arial' };\n  row.getCell(1).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: fill } };\n  row.getCell(2).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: fill } };\n  row.getCell(1).alignment = { vertical: 'middle', indent: 1 };\n  row.getCell(2).alignment = { vertical: 'middle', wrapText: false };\n  row.getCell(1).border = { bottom: { style: 'hair', color: { argb: 'FFDDDDDD' } } };\n  row.getCell(2).border = { bottom: { style: 'hair', color: { argb: 'FFDDDDDD' } } };\n});\n\n// ── SHEET 2: QOH vs ATS vs OnOrder ──────────────────────────────────────────────\nconst s2 = workbook.addWorksheet('QOH vs ATS vs OnOrder');\ns2.getColumn(1).width  = 6;\ns2.getColumn(2).width  = 22;\ns2.getColumn(3).width  = 8;\ns2.getColumn(4).width  = 8;\ns2.getColumn(5).width  = 11;\ns2.getColumn(6).width  = 11;\ns2.getColumn(7).width  = 11;\ns2.getColumn(8).width  = 11;\ns2.getColumn(9).width  = 15;\ns2.getColumn(10).width = 13;\ns2.getColumn(11).width = 18;\ns2.getColumn(12).width = 18;\ns2.getColumn(13).width = 10;\ns2.getColumn(14).width = 18;\ns2.getColumn(15).width = 18;\ns2.getColumn(16).width = 20;\n\nconst s2HeaderRow = s2.addRow([]);\nconst s2Headers = ['#', 'Item Number', 'QOH', 'ATS', 'Wkly Vel.', 'Curr. WOS', 'Target WOS', 'Target Qty', 'Open Order Qty', 'Shipped Qty', 'Customer UPC', 'Acme UPC', 'UPC Mismatch', 'Earliest Delivery', 'MGD2', 'Family'];\ns2Headers.forEach((h, i) => {\n  const cell = s2HeaderRow.getCell(i + 1);\n  cell.value = h;\n  cell.font  = { bold: true, color: { argb: WHITE }, name: 'Arial', size: 11 };\n  cell.fill  = { type: 'pattern', pattern: 'solid', fgColor: { argb: BRAND_PRIMARY } };\n  cell.alignment = { horizontal: 'left', vertical: 'middle' };\n});\ns2HeaderRow.height = 22;\ns2.views = [{ state: 'frozen', xSplit: 0, ySplit: 1, topLeftCell: 'A2' }];\n\nlet lastMgd2   = null;\nlet lastFamily = null;\nlet dataRowIdx = 0;\n\nsummaryItems.forEach(item => {\n  // Trim display values too — the raw SAP field is fixed-width and padded\n  // with trailing spaces, which would otherwise show up as ragged header rows.\n  const mgd2   = (item.mgd2   ? item.mgd2.trim()   : '') || 'N/A';\n  const family = (item.family ? item.family.trim() : '') || 'N/A';\n\n  if (mgd2 !== lastMgd2) {\n    const mgd2Row = s2.addRow([]);\n    mgd2Row.getCell(1).value = mgd2;\n    mgd2Row.height = 20;\n    for (let c = 1; c <= 16; c++) {\n      mgd2Row.getCell(c).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: DARK_GRAY } };\n    }\n    mgd2Row.getCell(1).font = { bold: true, color: { argb: WHITE }, name: 'Arial', size: 11 };\n    mgd2Row.getCell(1).alignment = { horizontal: 'left', vertical: 'middle', indent: 1 };\n    lastMgd2   = mgd2;\n    lastFamily = null;\n  }\n\n  if (family !== lastFamily) {\n    const famRow = s2.addRow([]);\n    famRow.getCell(2).value = family;\n    famRow.height = 18;\n    for (let c = 1; c <= 16; c++) {\n      famRow.getCell(c).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: LIGHT_GRAY } };\n    }\n    famRow.getCell(2).font = { bold: true, name: 'Arial', size: 10 };\n    famRow.getCell(2).alignment = { horizontal: 'left', vertical: 'middle', indent: 2 };\n    lastFamily = family;\n  }\n\n  // Same velocity/coverage formula used in renderRecSection, applied here\n  // so every submitted item — not just recommended ones — shows its\n  // sell-through position at a glance.\n  const customerQOH    = Number(item.qtyOnHand)       || 0;\n  const shipped12mo    = Number(item.totalShippedQty) || 0;\n  const soldThrough    = Math.max(0, shipped12mo - customerQOH);\n  const weeklyVelocity = soldThrough > 0 ? +(soldThrough / 52).toFixed(2) : 0;\n  const currentWOS     = weeklyVelocity > 0 ? +(customerQOH / weeklyVelocity).toFixed(1) : 0;\n  const targetWOS      = targetWeeksOnHand;\n  const targetQty      = weeklyVelocity > 0 ? Math.ceil(targetWOS * weeklyVelocity) : 0;\n\n  const fillColor = dataRowIdx % 2 === 0 ? WHITE : ALT_ROW;\n  const row = s2.addRow([]);\n  row.getCell(1).value  = item.lineNumber;\n  row.getCell(2).value  = item.mfrItemNumber || item.rawItemRef;\n  row.getCell(3).value  = customerQOH;\n  row.getCell(4).value  = item.ats !== null ? Number(item.ats) : 0;\n  row.getCell(5).value  = weeklyVelocity;\n  row.getCell(6).value  = currentWOS;\n  row.getCell(7).value  = targetWOS;\n  row.getCell(8).value  = targetQty;\n  row.getCell(9).value  = Number(item.openOrderQty)    || 0;\n  row.getCell(10).value = shipped12mo;\n  row.getCell(11).value = item.customerUpc             || '';\n  row.getCell(12).value = item.thiUpc                  || '';\n  row.getCell(13).value = item.upcMismatch ? 'MISMATCH' : '';\n  row.getCell(14).value = item.earliestDelivery        || '';\n  row.getCell(15).value = mgd2;\n  row.getCell(16).value = family;\n  row.height = 18;\n\n  for (let c = 1; c <= 16; c++) {\n    const cell = row.getCell(c);\n    cell.font  = { name: 'Arial', size: 10 };\n    cell.fill  = { type: 'pattern', pattern: 'solid', fgColor: { argb: fillColor } };\n    cell.border = { bottom: { style: 'hair', color: { argb: 'FFEEEEEE' } } };\n    cell.alignment = { vertical: 'middle' };\n  }\n  row.getCell(3).alignment  = { horizontal: 'center', vertical: 'middle' };\n  row.getCell(4).alignment  = { horizontal: 'center', vertical: 'middle' };\n  row.getCell(5).alignment  = { horizontal: 'center', vertical: 'middle' };\n  row.getCell(5).numFmt     = '0.00';\n  row.getCell(6).alignment  = { horizontal: 'center', vertical: 'middle' };\n  row.getCell(6).numFmt     = '0.0';\n  row.getCell(7).alignment  = { horizontal: 'center', vertical: 'middle' };\n  row.getCell(8).alignment  = { horizontal: 'center', vertical: 'middle' };\n  row.getCell(9).alignment  = { horizontal: 'center', vertical: 'middle' };\n  row.getCell(10).alignment = { horizontal: 'center', vertical: 'middle' };\n  row.getCell(14).alignment = { horizontal: 'center', vertical: 'middle' };\n\n  // Curr. WOS — same thresholds/colors as the Recommendation tab\n  if (currentWOS < 2) {\n    row.getCell(6).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFC00000' } };\n    row.getCell(6).font = { name: 'Arial', size: 10, bold: true, color: { argb: WHITE } };\n  } else if (currentWOS < 5) {\n    row.getCell(6).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFFFC7CE' } };\n    row.getCell(6).font = { name: 'Arial', size: 10, color: { argb: 'FF9C0006' } };\n  }\n\n  // Wkly Vel. — same thresholds/colors as the Recommendation tab\n  if (weeklyVelocity > 6) {\n    row.getCell(5).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF375623' } };\n    row.getCell(5).font = { name: 'Arial', size: 10, bold: true, color: { argb: WHITE } };\n  } else if (weeklyVelocity > 2) {\n    row.getCell(5).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFC6EFCE' } };\n    row.getCell(5).font = { name: 'Arial', size: 10, color: { argb: 'FF276221' } };\n  }\n\n  if (item.upcMismatch) {\n    row.getCell(13).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: MISMATCH_RED } };\n    row.getCell(13).font = { name: 'Arial', size: 10, bold: true, color: { argb: WHITE } };\n    row.getCell(13).alignment = { horizontal: 'center', vertical: 'middle' };\n  }\n\n  dataRowIdx++;\n});\n\n// ── SHEET 3: OPPORTUNITY ITEMS ────────────────────────────────────────────\nconst s3 = workbook.addWorksheet('Opportunity Items');\ns3.getColumn(1).width = 22;\ns3.getColumn(2).width = 10;\ns3.getColumn(3).width = 20;\ns3.getColumn(4).width = 14;\ns3.getColumn(6).width = 28;\ns3.getColumn(7).width = 52;\n\n// Row 1: header cols A-D, legend inline cols F-K all on same row\nconst oppHeaderRow = s3.getRow(1);\noppHeaderRow.height = 22;\nconst oppHeaders = ['Material', 'ATS', 'Total Shipped Qty', 'Order Count'];\noppHeaders.forEach((h, i) => {\n  const cell = oppHeaderRow.getCell(i + 1);\n  cell.value = h;\n  cell.font  = { bold: true, color: { argb: WHITE }, name: 'Arial', size: 11 };\n  cell.fill  = { type: 'pattern', pattern: 'solid', fgColor: { argb: BRAND_PRIMARY } };\n  cell.alignment = { horizontal: 'left', vertical: 'middle' };\n});\n\n// Legend label col F\nconst oppLegLabel = s3.getCell(1, 6);\noppLegLabel.value = 'COLOR LEGEND:';\noppLegLabel.font  = { bold: true, name: 'Arial', size: 9, color: { argb: WHITE } };\noppLegLabel.fill  = { type: 'pattern', pattern: 'solid', fgColor: { argb: DARK_GRAY } };\noppLegLabel.alignment = { horizontal: 'center', vertical: 'middle' };\n\n// Neon green swatch col G\nconst oppLeg1Swatch = s3.getCell(1, 7);\noppLeg1Swatch.value = 'Neon Green';\noppLeg1Swatch.font  = { bold: true, name: 'Arial', size: 8, color: { argb: 'FF000000' } };\noppLeg1Swatch.fill  = { type: 'pattern', pattern: 'solid', fgColor: { argb: NEON_GREEN } };\noppLeg1Swatch.alignment = { horizontal: 'center', vertical: 'middle' };\noppLeg1Swatch.border = { top: { style: 'thin', color: { argb: 'FFCCCCCC' } }, bottom: { style: 'thin', color: { argb: 'FFCCCCCC' } }, left: { style: 'thin', color: { argb: 'FFCCCCCC' } }, right: { style: 'thin', color: { argb: 'FFCCCCCC' } } };\n\n// Neon green desc col H\nconst oppLeg1Desc = s3.getCell(1, 8);\noppLeg1Desc.value = 'Item on order but less than 1 month supply';\noppLeg1Desc.font  = { name: 'Arial', size: 8 };\noppLeg1Desc.fill  = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFFAFAFA' } };\noppLeg1Desc.alignment = { vertical: 'middle' };\noppLeg1Desc.border = { top: { style: 'thin', color: { argb: 'FFCCCCCC' } }, bottom: { style: 'thin', color: { argb: 'FFCCCCCC' } }, left: { style: 'thin', color: { argb: 'FFCCCCCC' } }, right: { style: 'thin', color: { argb: 'FFCCCCCC' } } };\n\n// Light pink swatch col I\nconst oppLeg2Swatch = s3.getCell(1, 9);\noppLeg2Swatch.value = 'Light Pink';\noppLeg2Swatch.font  = { bold: true, name: 'Arial', size: 8, color: { argb: 'FF000000' } };\noppLeg2Swatch.fill  = { type: 'pattern', pattern: 'solid', fgColor: { argb: LIGHT_PINK } };\noppLeg2Swatch.alignment = { horizontal: 'center', vertical: 'middle' };\noppLeg2Swatch.border = { top: { style: 'thin', color: { argb: 'FFCCCCCC' } }, bottom: { style: 'thin', color: { argb: 'FFCCCCCC' } }, left: { style: 'thin', color: { argb: 'FFCCCCCC' } }, right: { style: 'thin', color: { argb: 'FFCCCCCC' } } };\n\n// Light pink desc col J\nconst oppLeg2Desc = s3.getCell(1, 10);\noppLeg2Desc.value = 'Total Shipped = 0 AND Order Count = 0';\noppLeg2Desc.font  = { name: 'Arial', size: 8 };\noppLeg2Desc.fill  = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFFAFAFA' } };\noppLeg2Desc.alignment = { vertical: 'middle' };\noppLeg2Desc.border = { top: { style: 'thin', color: { argb: 'FFCCCCCC' } }, bottom: { style: 'thin', color: { argb: 'FFCCCCCC' } }, left: { style: 'thin', color: { argb: 'FFCCCCCC' } }, right: { style: 'thin', color: { argb: 'FFCCCCCC' } } };\n\ns3.getColumn(6).width = 16;\ns3.getColumn(7).width = 14;\ns3.getColumn(8).width = 36;\ns3.getColumn(9).width = 14;\ns3.getColumn(10).width = 40;\n\ns3.views = [{ state: 'frozen', xSplit: 0, ySplit: 1, topLeftCell: 'A2' }];\n\n(d.opportunityItems || []).filter(item => (item.ats ?? 0) >= 10).forEach((item, i) => {\n  const totalShipped = item.salesData ? Number(item.salesData.totalShippedQty) || 0 : 0;\n  const orderCount   = item.salesData ? Number(item.salesData.orderCount)      || 0 : 0;\n\n  const isNeverPurchased = totalShipped === 0 && orderCount === 0;\n  const isHighVelocity   = orderCount > 0 && (totalShipped / 12) > orderCount;\n\n  const fillColor = isHighVelocity   ? NEON_GREEN :\n                    isNeverPurchased  ? LIGHT_PINK :\n                    (i % 2 === 0     ? WHITE       : ALT_ROW);\n\n  const row = s3.addRow([]);\n  row.getCell(1).value = item.material;\n  row.getCell(2).value = Number(item.ats) || 0;\n  row.getCell(3).value = totalShipped;\n  row.getCell(4).value = orderCount;\n  row.height = 18;\n  for (let c = 1; c <= 4; c++) {\n    const cell = row.getCell(c);\n    cell.font  = { name: 'Arial', size: 10 };\n    cell.fill  = { type: 'pattern', pattern: 'solid', fgColor: { argb: fillColor } };\n    cell.border = { bottom: { style: 'hair', color: { argb: 'FFEEEEEE' } } };\n    cell.alignment = { vertical: 'middle' };\n  }\n});\n\n// ── SHEET 4: AI RECOMMENDATION ────────────────────────────────────────────\nconst s4 = workbook.addWorksheet('Recommendation');\ns4.getColumn(1).width  = 22;   // Item No       — col A\ns4.getColumn(2).width  = 18;   // UPC           — col B\ns4.getColumn(3).width  = 50;   // Description   — col C\ns4.getColumn(4).width  = 12;   // Brand         — col D\ns4.getColumn(5).width  = 14;   // Sub-Family    — col E\ns4.getColumn(6).width  = 10;   // MGD2          — col F\ns4.getColumn(7).width  = 10;   // Case Pack     — col G\ns4.getColumn(8).width  = 11;   // Cust. QOH     — col H\ns4.getColumn(9).width  = 11;   // Wkly Vel.     — col I\ns4.getColumn(10).width = 11;   // Curr. WOS     — col J\ns4.getColumn(11).width = 11;   // Target WOS    — col K\ns4.getColumn(12).width = 11;   // Target Qty    — col L\ns4.getColumn(13).width = 12;   // On Order Qty  — col M\ns4.getColumn(14).width = 11;   // Rec. Qty      — col N\ns4.getColumn(15).width = 14;   // Net Price     — col O\ns4.getColumn(16).width = 55;   // Rationale     — col P\n\n// ── Rows 1-8: Narrative (A1:G8) and Legend (H1:O8) ───────────────────────\n// Set fixed row heights for the header block\nfor (let r = 1; r <= 8; r++) {\n  s4.getRow(r).height = r === 1 ? 20 : 17;\n}\n\n// Narrative title A1:G1\nconst narTitleCell = s4.getCell(1, 1);\nnarTitleCell.value = 'RECOMMENDATION NARRATIVE';\nnarTitleCell.font  = { bold: true, color: { argb: WHITE }, name: 'Arial', size: 11 };\nnarTitleCell.fill  = { type: 'pattern', pattern: 'solid', fgColor: { argb: BRAND_PRIMARY } };\nnarTitleCell.alignment = { vertical: 'middle', indent: 1 };\ns4.mergeCells(1, 1, 1, 7);\n// Fill remaining cols 8-16 on row 1 red for visual continuity\nfor (let c = 8; c <= 16; c++) {\n  s4.getCell(1, c).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: BRAND_PRIMARY } };\n}\n\n// Narrative content A2:G8\nconst narCell = s4.getCell(2, 1);\nnarCell.value = aiNarrative;\nnarCell.font  = { name: 'Arial', size: 10 };\nnarCell.fill  = { type: 'pattern', pattern: 'solid', fgColor: { argb: LIGHT_GRAY } };\nnarCell.alignment = { vertical: 'top', wrapText: true, indent: 1 };\ns4.mergeCells(2, 1, 8, 7);\n// Fill A2:G8 background for rows 3-8 (merge covers them but set fill on merged cell only)\n\n// Legend title H1:O1\nconst legTitleCell = s4.getCell(1, 8);\nlegTitleCell.value = 'COLOR LEGEND';\nlegTitleCell.font  = { bold: true, name: 'Arial', size: 9, color: { argb: WHITE } };\nlegTitleCell.fill  = { type: 'pattern', pattern: 'solid', fgColor: { argb: DARK_GRAY } };\nlegTitleCell.alignment = { horizontal: 'center', vertical: 'middle' };\ns4.mergeCells(1, 8, 1, 16);\n\n// Legend entries H2:O8 — 7 data rows for 6 entries + 1 spare\nconst legendEntries = [\n  { color: NEON_GREEN,  label: 'Neon Green Row',   darkText: true,  desc: 'Urgent: Wkly Vel. > 10 AND Curr. WOS < 2 (Available Now only)' },\n  { color: 'FFC00000',  label: 'Dark Red (WOS)',    darkText: false, desc: 'Curr. WOS < 2 — Critically low weeks of supply' },\n  { color: 'FFFFC7CE',  label: 'Light Red (WOS)',   darkText: true,  desc: 'Curr. WOS < 5 — Low weeks of supply' },\n  { color: 'FF375623',  label: 'Dark Green (Vel)',  darkText: false, desc: 'Wkly Vel. > 6 — High velocity' },\n  { color: 'FFC6EFCE',  label: 'Light Green (Vel)', darkText: true,  desc: 'Wkly Vel. > 2 — Moderate velocity' },\n  { color: BRAND_ACCENT, label: 'Gold (Rec. Qty)',   darkText: false, desc: 'Recommended order quantity — action column' },\n];\n\nlegendEntries.forEach((entry, i) => {\n  const r = 2 + i;\n  // Swatch: col H (8), spanning cols H-I (8-9)\n  const swatchCell = s4.getCell(r, 8);\n  swatchCell.value = entry.label;\n  swatchCell.font  = { bold: true, name: 'Arial', size: 8, color: { argb: entry.darkText ? 'FF000000' : WHITE } };\n  swatchCell.fill  = { type: 'pattern', pattern: 'solid', fgColor: { argb: entry.color } };\n  swatchCell.alignment = { horizontal: 'center', vertical: 'middle' };\n  swatchCell.border = { top: { style: 'thin', color: { argb: 'FFCCCCCC' } }, bottom: { style: 'thin', color: { argb: 'FFCCCCCC' } }, left: { style: 'thin', color: { argb: 'FFCCCCCC' } }, right: { style: 'thin', color: { argb: 'FFCCCCCC' } } };\n  s4.mergeCells(r, 8, r, 10);\n\n  // Description: cols K-P (11-16)\n  const descCell = s4.getCell(r, 11);\n  descCell.value = entry.desc;\n  descCell.font  = { name: 'Arial', size: 8 };\n  descCell.fill  = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFFAFAFA' } };\n  descCell.alignment = { vertical: 'middle', wrapText: true };\n  descCell.border = { top: { style: 'thin', color: { argb: 'FFCCCCCC' } }, bottom: { style: 'thin', color: { argb: 'FFCCCCCC' } }, left: { style: 'thin', color: { argb: 'FFCCCCCC' } }, right: { style: 'thin', color: { argb: 'FFCCCCCC' } } };\n  s4.mergeCells(r, 11, r, 16);\n});\n\n// ── Row 9: Spacer ─────────────────────────────────────────────────────────\ns4.getRow(9).height = 8;\n\n// ── Row 10: Global column headers — FROZEN ────────────────────────────────\nconst globalHdrRow = s4.getRow(10);\nglobalHdrRow.height = 20;\nconst hdrs = [\n  'Item No', 'UPC', 'Description', 'Brand', 'Sub-Family', 'MGD2',\n  'Case Pack', 'Cust. QOH', 'Wkly Vel.', 'Curr. WOS', 'Target WOS', 'Target Qty',\n  'On Order Qty', 'Rec. Qty', 'Net Price', 'Rationale'\n];\nhdrs.forEach(function(h, i) {\n  const cell = globalHdrRow.getCell(i + 1);\n  cell.value = h;\n  cell.font  = { bold: true, color: { argb: WHITE }, name: 'Arial', size: 10 };\n  cell.fill  = { type: 'pattern', pattern: 'solid', fgColor: { argb: BRAND_PRIMARY } };\n  cell.alignment = { horizontal: 'left', vertical: 'middle' };\n});\n\n// Freeze through row 10 — section titles scroll freely below\ns4.views = [{ state: 'frozen', xSplit: 0, ySplit: 10, topLeftCell: 'A11' }];\n\n// ── Sections render from row 11 down ──────────────────────────────────────\nrenderRecSection(s4, availableNow, 'AVAILABLE FOR IMMEDIATE DELIVERY', BRAND_PRIMARY,  true);\nrenderRecSection(s4, futureAvail,  'FUTURE AVAILABILITY',              FUTURE_BLUE, false);\n\n// ── GENERATE BINARY ───────────────────────────────────────────────────────\nconst xlsxBuffer = await workbook.xlsx.writeBuffer();\nconst fileName   = `IIRS_Report_${d.customer.customerId}_${new Date().toISOString().split('T')[0]}.xlsx`;\n\nconst binaryData = await this.helpers.prepareBinaryData(\n  Buffer.from(xlsxBuffer),\n  fileName,\n  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'\n);\n\nreturn [{\n  json: {\n    reportDate: new Date().toISOString(),\n    customer:   d.customer,\n    summary: {\n      itemsSubmitted:          d.items.length,\n      openOrderCount:          meta.openOrderCount    || 0,\n      salesHistoryCount:       meta.salesHistoryCount || 0,\n      availabilityCount:       meta.availabilityCount || 0,\n      opportunityCount:        meta.opportunityCount  || 0,\n      availableNowCount:       availableNow.length,\n      futureAvailabilityCount: futureAvail.length,\n      stage2CompletedAt:       meta.stage2CompletedAt || ''\n    }\n  },\n  binary: { data: binaryData }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1024,
+        336
+      ],
+      "id": "472f73c3-6998-4b3b-b98b-5423db2a5b3b",
+      "name": "Build Report with exceljs"
+    },
+    {
+      "parameters": {
+        "jsCode": "const d = $input.first().json;\n\nreturn [{ json: d }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        576,
+        336
+      ],
+      "id": "5a8a6d23-5714-4763-8c60-ad4c0b846dd1",
+      "name": "Code in JavaScript4"
+    },
+    {
+      "parameters": {
+        "workflowId": {
+          "__rl": true,
+          "value": "REPLACE_WITH_WORKFLOW_ID",
+          "mode": "id"
+        },
+        "workflowInputs": {
+          "mappingMode": "defineBelow",
+          "value": {},
+          "matchingColumns": [],
+          "schema": [],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": true
+        },
+        "options": {
+          "waitForSubWorkflow": true
+        }
+      },
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.3,
+      "position": [
+        800,
+        336
+      ],
+      "id": "02f078c8-149c-48cd-a1fb-a16fc1cb53cd",
+      "name": "Call 'STAGE 3 - Recommendation Engine'"
+    },
+    {
+      "parameters": {
+        "jsCode": "const envelope = $('Initialize Envelope').item.json;\nconst stage2   = $('Call \\'STAGE 2 - SAC Data Retrieval\\'').item.json;\n\n// Convert UTC (Z) timestamp to US Eastern time, formatted as\n// \"YYYY-MM-DD HH:mm:ss\". Uses Intl so EST/EDT is handled automatically\n// based on the date (no manual offset math, no DST bugs).\nfunction toEasternString(isoString) {\n  const d = new Date(isoString);\n  if (isNaN(d.getTime())) return isoString; // fallback if unparseable\n\n  const parts = new Intl.DateTimeFormat('en-US', {\n    timeZone: 'America/New_York',\n    year: 'numeric',\n    month: '2-digit',\n    day: '2-digit',\n    hour: '2-digit',\n    minute: '2-digit',\n    second: '2-digit',\n    hour12: false\n  }).formatToParts(d);\n\n  const get = (type) => parts.find(p => p.type === type)?.value;\n  return `${get('year')}-${get('month')}-${get('day')} ${get('hour')}:${get('minute')}:${get('second')}`;\n}\n\nconst rawReceivedAt = (envelope.receivedAt ?? new Date().toISOString()).replace(/^=/, '');\nconst submittedAtEastern = toEasternString(rawReceivedAt);\n\nreturn [{\n  json: {\n    'Submitted By':    envelope.senderName?.replace(/^=/, '')        ?? '',\n    'Sender Email':    envelope.senderEmail?.replace(/^=/, '')       ?? '',\n    'Customer Name':   stage2.customer.customerName?.replace(/^=/, '') ?? '',\n    'Customer ID':     String(stage2.customer.customerId ?? '').replace(/^=/, ''),\n    'Submitted At':    submittedAtEastern,\n    'Items Count':     stage2.items.length ?? 0,\n    'Workflow Run ID': envelope.workflowRunId?.replace(/^=/, '')     ?? ''\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1472,
+        336
+      ],
+      "id": "ad9a6c06-d8cf-45a7-81b8-2b6683b326fb",
+      "name": "Envelope Results"
+    },
+    {
+      "parameters": {
+        "resource": "table",
+        "workbook": {
+          "__rl": true,
+          "value": "REPLACE_ME",
+          "mode": "id"
+        },
+        "worksheet": {
+          "__rl": true,
+          "value": "REPLACE_ME",
+          "mode": "id"
+        },
+        "table": {
+          "__rl": true,
+          "value": "REPLACE_ME",
+          "mode": "id"
+        },
+        "dataMode": "autoMap",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.microsoftExcel",
+      "typeVersion": 2.2,
+      "position": [
+        1696,
+        336
+      ],
+      "id": "00c6085f-f6f8-43f4-9948-d2d83375f2e8",
+      "name": "Append rows to table",
+      "credentials": {
+        "microsoftExcelOAuth2Api": {
+          "id": "REPLACE_ME",
+          "name": "Excel account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": " {{ $json.sql }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        -992,
+        240
+      ],
+      "id": "bbde3696-8dd6-43cc-8828-ef08a3c7701a",
+      "name": "Execute a SQL query",
+      "alwaysOutputData": true,
+      "credentials": {
+        "postgres": {
+          "id": "REPLACE_ME",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const workingObject = $('Build UPC Lookup Query').item.json;\nconst lookupRows = $input.all().map(r => r.json).filter(r => r.material && r.upc);\nconst upcToSku = new Map(lookupRows.map(r => [r.upc, r.material]));\n\n// Build a map of UPC → qtyOnHand from the submission\n// so we can correctly assign QOH to the resolved Acme SKU\nconst upcToQoh = new Map();\nfor (const it of workingObject.items) {\n  if (it.upc && it.qtyOnHand !== null && it.qtyOnHand !== undefined) {\n    // Take the highest QOH if the same UPC appears on multiple items\n    const existing = upcToQoh.get(it.upc);\n    if (existing === undefined || it.qtyOnHand > existing) {\n      upcToQoh.set(it.upc, it.qtyOnHand);\n    }\n  }\n}\n\n// Resolve items and deduplicate by resolved mfrItemNumber\n// keeping QOH from the UPC map\nconst resolvedMap = new Map();\n\nfor (const it of workingObject.items) {\n  const resolveViaUpcRef = it.itemRefType === 'upc' && !it.itemResolved && upcToSku.has(it.upc);\n  const resolveViaUpcCol = it.itemRefType === 'customer-sku' && !it.itemResolved && it.upc && upcToSku.has(it.upc);\n\n  if (resolveViaUpcRef || resolveViaUpcCol) {\n    const sku = upcToSku.get(it.upc);\n    const qoh = upcToQoh.get(it.upc) ?? it.qtyOnHand ?? null;\n\n    if (resolvedMap.has(sku)) {\n      // Already have this SKU — merge QOH if this one is higher\n      const existing = resolvedMap.get(sku);\n      if (qoh !== null && (existing.qtyOnHand === null || qoh > existing.qtyOnHand)) {\n        existing.qtyOnHand = qoh;\n      }\n    } else {\n      resolvedMap.set(sku, {\n        ...it,\n        mfrItemNumber: sku,\n        itemRefType: 'brand-a-sku',\n        itemResolved: true,\n        resolutionSource: 'upc-lookup',\n        resolutionConfidence: 0.95,\n        qtyOnHand: qoh,\n        parseNotes: (it.parseNotes ? it.parseNotes + ' | ' : '') + 'Resolved via UPC decoder (materials)'\n      });\n    }\n  } else {\n    // Not UPC-resolved — keep as-is but check for mfrItemNumber collision\n    // with something we already resolved via UPC\n    const key = it.mfrItemNumber ?? it.rawItemRef;\n    if (!resolvedMap.has(key)) {\n      resolvedMap.set(key, it);\n    }\n  }\n}\n\nconst finalItems = Array.from(resolvedMap.values());\n\nconst resolvedCount = finalItems.filter(it => it.itemResolved).length;\nconst parseConfidence = finalItems.length > 0\n  ? Math.round((resolvedCount / finalItems.length) * 100) / 100\n  : 0;\nconst manualReviewItems = finalItems.filter(it => !it.itemResolved);\nconst needsManualReview = manualReviewItems.length > 0;\n\nreturn {\n  json: {\n    ...workingObject,\n    items: finalItems,\n    envelope: { ...workingObject.envelope, parseConfidence },\n    _meta: {\n      ...workingObject._meta,\n      manualReviewRequired: needsManualReview,\n      manualReviewCount: manualReviewItems.length\n    }\n  }\n};"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -768,
+        240
+      ],
+      "id": "b4ae424e-5bb7-42cd-823b-a9ac8bbffc58",
+      "name": "Apply UPC Resolution"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const workingObject = $input.item.json;\nconst escUpc = (v) => String(v).replace(/'/g, \"''\");\n\n// Include unresolved UPC items AND unresolved customer-sku items that have\n// a UPC value captured from a separate UPC column in the submission file\nconst upcItems = workingObject.items.filter(it =>\n  !it.itemResolved && it.upc &&\n  (it.itemRefType === 'upc' || it.itemRefType === 'customer-sku')\n);\n\nconst upcList = [...new Set(upcItems.map(it => escUpc(it.upc)))];\n\nconst sql = upcList.length > 0\n  ? `SELECT material, upc FROM materials WHERE upc IN ('${upcList.join(\"','\")}');`\n  : `SELECT NULL AS material, NULL AS upc WHERE FALSE;`;\n\nreturn { json: { ...workingObject, sql } };"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -1216,
+        240
+      ],
+      "id": "4e1c8ebf-a2f7-438a-bb85-326a9c2bc2a2",
+      "name": "Build UPC Lookup Query"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const workingObject = $input.item.json;\nconst escVal = (v) => String(v).replace(/'/g, \"''\");\n\n// Legacy part numbers (older numbering that was later renumbered) are sometimes carried over by\n// customers as old stock, but the live materials master only has the current prefixed version of\n// the same item. Flag these so we also query the prefixed candidate, not just the literal legacy\n// string, which would never match on its own.\nconst LEGACY_PREFIX_PATTERN = /^77[0-9A-Z]{4,8}$/i;\n\n// Some customers append a trailing \"FG\" (finished goods) tag to Acme SKUs\n// (e.g. A-100234FG, BR22B6FG). The live master carries the SKU\n// without it, so also query the FG-stripped candidate. Fallback only --\n// the literal string is always queried too.\nconst FG_SUFFIX_PATTERN = /^(.{5,})FG$/i;\n\nconst skuItems = workingObject.items.filter(it =>\n  it.mfrItemNumber && ['brand-a-sku','brand-b-sku','brand-c-sku'].includes(it.itemRefType)\n);\n\nconst flatSkuSet = new Set();\nskuItems.forEach(it => {\n  const flat = it.mfrItemNumber.replace(/-/g, '').toUpperCase();\n  flatSkuSet.add(escVal(flat));\n  if (LEGACY_PREFIX_PATTERN.test(flat)) {\n    flatSkuSet.add(escVal('N' + flat));\n  }\n  const fgMatch = flat.match(FG_SUFFIX_PATTERN);\n  if (fgMatch) {\n    flatSkuSet.add(escVal(fgMatch[1]));\n  }\n});\nconst flatSkus = [...flatSkuSet];\n\nconst skuSql = flatSkus.length > 0\n  ? `SELECT material, REPLACE(UPPER(material), '-', '') AS flat_key FROM materials WHERE REPLACE(UPPER(material), '-', '') IN ('${flatSkus.join(\"','\")}');`\n  : `SELECT NULL AS material, NULL AS flat_key WHERE FALSE;`;\n\nreturn { json: { ...workingObject, skuSql } };"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -544,
+        240
+      ],
+      "id": "9fc5b7a4-a75d-420b-8377-f32c136ecc9d",
+      "name": "Build SKU Verification Query"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "{{ $json.skuSql }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        -320,
+        240
+      ],
+      "id": "670bfb46-8c4f-4e20-91c6-4799e918c82b",
+      "name": "Query SKU Verification",
+      "credentials": {
+        "postgres": {
+          "id": "REPLACE_ME",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const workingObject = $('Build SKU Verification Query').item.json;\nconst rows = $input.all().map(r => r.json).filter(r => r.material && r.flat_key);\nconst flatToReal = new Map(rows.map(r => [r.flat_key, r.material]));\n\n// Legacy part numbers (older numbering that was later renumbered) are sometimes carried over by\n// customers as old stock, but the live materials master only has the current prefixed version of\n// the same item. Flag these so we also query the prefixed candidate, not just the literal legacy\n// string, which would never match on its own.\nconst LEGACY_PREFIX_PATTERN = /^77[0-9A-Z]{4,8}$/i;\n\n// Trailing \"FG\" (finished goods) tag some customers append to Acme SKUs,\n// e.g. A-100234FG -> A-100234. Fallback only: tried after the direct\n// match and the legacy-prefix remap fail.\nconst FG_SUFFIX_PATTERN = /^(.{5,})FG$/i;\n\nconst finalItems = workingObject.items.map(it => {\n  // UPC-resolved items were already confirmed against materials via\n  // UPC lookup (resolutionConfidence 0.95, resolutionSource 'upc-lookup').\n  // Re-running a SKU-format check against them is redundant and can\n  // incorrectly downgrade a valid resolution if the flattened SKU string\n  // doesn't match materials' formatting — so they're exempt here.\n  if (it.resolutionSource === 'upc-lookup') {\n    return it;\n  }\n\n  if (it.mfrItemNumber && ['brand-a-sku','brand-b-sku','brand-c-sku'].includes(it.itemRefType)) {\n    const flat = it.mfrItemNumber.replace(/-/g, '').toUpperCase();\n\n    if (flatToReal.has(flat)) {\n      const realSku = flatToReal.get(flat);\n      if (realSku !== it.mfrItemNumber) {\n        return {\n          ...it,\n          mfrItemNumber: realSku,\n          parseNotes: (it.parseNotes ? it.parseNotes + ' | ' : '') + `SKU reformatted to match materials (${realSku})`\n        };\n      }\n      return it;\n    }\n\n    // Direct match failed -- if this looks like a legacy-prefix model number, try the current\n    // prefixed equivalent before giving up and flagging the item for manual review.\n    if (LEGACY_PREFIX_PATTERN.test(flat)) {\n      const legacyFlat = 'N' + flat;\n      if (flatToReal.has(legacyFlat)) {\n        const realSku = flatToReal.get(legacyFlat);\n        return {\n          ...it,\n          mfrItemNumber: realSku,\n          itemRefType: 'brand-b-sku',\n          parseNotes: (it.parseNotes ? it.parseNotes + ' | ' : '') + `Legacy-prefix model number remapped to current SKU (${realSku})`\n        };\n      }\n    }\n\n    // Still no match -- try stripping a trailing customer-added \"FG\" tag.\n    const fgMatch = flat.match(FG_SUFFIX_PATTERN);\n    if (fgMatch && flatToReal.has(fgMatch[1])) {\n      const realSku = flatToReal.get(fgMatch[1]);\n      return {\n        ...it,\n        mfrItemNumber: realSku,\n        parseNotes: (it.parseNotes ? it.parseNotes + ' | ' : '') + `Trailing \"FG\" suffix stripped to match materials (${realSku})`\n      };\n    }\n\n    return {\n      ...it,\n      itemResolved: false,\n      resolutionConfidence: 0.0,\n      resolutionSource: null,\n      parseNotes: (it.parseNotes ? it.parseNotes + ' | ' : '') + 'SKU not found in materials master — flagged for manual review'\n    };\n  }\n  return it;\n});\n\nconst resolvedCount = finalItems.filter(it => it.itemResolved).length;\nconst parseConfidence = finalItems.length > 0 ? Math.round((resolvedCount / finalItems.length) * 100) / 100 : 0;\nconst manualReviewItems = finalItems.filter(it => !it.itemResolved);\nconst needsManualReview = manualReviewItems.length > 0;\n\nreturn {\n  json: {\n    ...workingObject,\n    items: finalItems,\n    envelope: { ...workingObject.envelope, parseConfidence },\n    _meta: { ...workingObject._meta, manualReviewRequired: needsManualReview, manualReviewCount: manualReviewItems.length }\n  }\n};"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -96,
+        240
+      ],
+      "id": "8d126820-abc3-40fc-a04f-d0e106bff758",
+      "name": "Apply SKU Verification"
+    },
+    {
+      "parameters": {
+        "jsCode": "// This node must run in \"Run Once for All Items\" mode — it needs to see\n// every chunk's parsed output at once to merge them into a single working\n// object before the rest of Stage 1 proceeds. For accounts under the\n// chunking threshold, this receives exactly 1 item and simply passes it\n// through unchanged (the merge logic is a no-op with only one chunk).\nconst allChunks = $input.all().map(i => i.json);\nif (allChunks.length === 0) throw new Error('Combine Parsed Chunks FATAL: no chunk data received.');\n\n// ── PASS 1: merge by raw submitted text ────────────────────────────────────\n// Catches exact duplicate rows within/across chunks (same rawItemRef\n// appearing more than once in the source file).\nconst mergedByRawRef = new Map();\nfor (const chunk of allChunks) {\n  for (const it of (chunk.items ?? [])) {\n    const key = it.rawItemRef.trim().toUpperCase();\n    if (mergedByRawRef.has(key)) {\n      const existing = mergedByRawRef.get(key);\n      const combinedQty = (existing.qtyOnHand ?? 0) + (it.qtyOnHand ?? 0);\n      existing.qtyOnHand = combinedQty;\n      existing.parseNotes = (existing.parseNotes ? existing.parseNotes + ' | ' : '') +\n        'Merged duplicate across chunks — summed qtyOnHand = ' + combinedQty;\n    } else {\n      mergedByRawRef.set(key, { ...it });\n    }\n  }\n}\nconst itemsAfterRawMerge = Array.from(mergedByRawRef.values());\n\n// ── PASS 2: merge by RESOLVED mfrItemNumber ─────────────────────────────\n// Two different raw source rows (e.g. two internal listing codes a\n// distributor uses for the same physical item) can independently resolve\n// to the identical final Acme SKU. Pass 1 can't catch this since the raw\n// text differs — this pass catches it after resolution. Items with no\n// resolved SKU (itemResolved: false) are left alone here — they're\n// genuinely distinct unresolved customer entries and must not be merged\n// together just because they share a null mfrItemNumber.\nconst mergedByResolvedSku = new Map();\nconst unresolvedItems = [];\n\nfor (const it of itemsAfterRawMerge) {\n  if (!it.mfrItemNumber) {\n    unresolvedItems.push(it);\n    continue;\n  }\n  const skuKey = it.mfrItemNumber.trim().toUpperCase();\n  if (mergedByResolvedSku.has(skuKey)) {\n    const existing = mergedByResolvedSku.get(skuKey);\n    const combinedQty = (existing.qtyOnHand ?? 0) + (it.qtyOnHand ?? 0);\n    existing.qtyOnHand = combinedQty;\n    existing.parseNotes = (existing.parseNotes ? existing.parseNotes + ' | ' : '') +\n      `Merged duplicate resolving to same SKU (raw: ${it.rawItemRef} -> ${skuKey}) — summed qtyOnHand = ${combinedQty}`;\n  } else {\n    mergedByResolvedSku.set(skuKey, { ...it });\n  }\n}\n\nconst finalItems = [...mergedByResolvedSku.values(), ...unresolvedItems];\nfinalItems.forEach((it, idx) => { it.lineNumber = idx + 1; });\n\nconst resolvedCount = finalItems.filter(it => it.itemResolved).length;\nconst parseConfidence = finalItems.length > 0\n  ? Math.round((resolvedCount / finalItems.length) * 100) / 100\n  : 0;\n\nconst manualReviewItems = finalItems.filter(it => !it.itemResolved);\nconst needsManualReview = manualReviewItems.length > 0;\n\nconst allWarnings = allChunks.flatMap(c => c._meta?.warnings ?? []);\n\n// Envelope fields (senderEmail, customerId, workflowRunId, etc.) are\n// identical across all chunks since they came from the same submission —\n// take them from the first chunk, but overwrite parseConfidence with the\n// recombined value.\nconst baseEnvelope = allChunks[0].envelope ?? {};\n\nconst workingObject = {\n  envelope: {\n    ...baseEnvelope,\n    parseConfidence\n  },\n  customer:         null,\n  items:            finalItems,\n  openOrders:       [],\n  availability:     [],\n  topItems:         [],\n  comparison:       null,\n  salesHistory:     null,\n  aiRecommendation: null,\n  _meta: {\n    stage1CompletedAt:    new Date().toISOString(),\n    itemCount:            finalItems.length,\n    reportDate:           allChunks[0]._meta?.reportDate ?? new Date().toISOString().split('T')[0],\n    manualReviewRequired: needsManualReview,\n    manualReviewCount:    manualReviewItems.length,\n    warnings:             allWarnings,\n    processingNotes:      allWarnings.length > 0 ? allWarnings.join(' | ') : null,\n    chunksProcessed:      allChunks.length\n  }\n};\n\nreturn { json: workingObject };"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -1440,
+        240
+      ],
+      "id": "3e1f65db-feec-43b7-a7aa-46098f66e8b0",
+      "name": "Combine Parsed Chunks"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Initialize Envelope": {
+      "main": [
+        [
+          {
+            "node": "Customer has ID",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build AI Parser Prompt": {
+      "main": [
+        [
+          {
+            "node": "Call Claude API (Parser)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Call Claude API (Parser)": {
+      "main": [
+        [
+          {
+            "node": "Parse & Validate API Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse & Validate API Response": {
+      "main": [
+        [
+          {
+            "node": "Combine Parsed Chunks",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Any Manual Review Items?": {
+      "main": [
+        [
+          {
+            "node": "Send Manual Review Notification",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    },
+    "Send Manual Review Notification": {
+      "main": [
+        []
+      ]
+    },
+    "FATAL - Invalid Sender": {
+      "main": [
+        [
+          {
+            "node": "Aggregate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Microsoft Outlook Trigger": {
+      "main": [
+        [
+          {
+            "node": "Route by File Type",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract from File": {
+      "main": [
+        [
+          {
+            "node": "Aggregate XLSX",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route by File Type": {
+      "main": [
+        [
+          {
+            "node": "Code in JavaScript",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Code in JavaScript1",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Code in JavaScript2",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Code in JavaScript3",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code in JavaScript": {
+      "main": [
+        [
+          {
+            "node": "Extract from File",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Aggregate": {
+      "main": [
+        [
+          {
+            "node": "Send an Email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract from File1": {
+      "main": [
+        [
+          {
+            "node": "Aggregate XLS",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code in JavaScript1": {
+      "main": [
+        [
+          {
+            "node": "Extract from File1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Aggregate XLSX": {
+      "main": [
+        [
+          {
+            "node": "Initialize Envelope",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Aggregate XLS": {
+      "main": [
+        [
+          {
+            "node": "Initialize Envelope",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract from File2": {
+      "main": [
+        [
+          {
+            "node": "Aggregate CSV",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code in JavaScript2": {
+      "main": [
+        [
+          {
+            "node": "Extract from File2",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Aggregate CSV": {
+      "main": [
+        [
+          {
+            "node": "Initialize Envelope",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract from File3": {
+      "main": [
+        [
+          {
+            "node": "Aggregate PDF",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code in JavaScript3": {
+      "main": [
+        [
+          {
+            "node": "Extract from File3",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Aggregate PDF": {
+      "main": [
+        [
+          {
+            "node": "Initialize Envelope",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Customer has ID": {
+      "main": [
+        [
+          {
+            "node": "Validate Sender Email1",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Send an Email1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Stage 1 Complete — Output": {
+      "main": [
+        [
+          {
+            "node": "Call 'STAGE 2 - SAC Data Retrieval'",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Call 'STAGE 2 - SAC Data Retrieval'": {
+      "main": [
+        [
+          {
+            "node": "Code in JavaScript4",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate Sender Email1": {
+      "main": [
+        [
+          {
+            "node": "Sender Authorized",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sender Authorized": {
+      "main": [
+        [
+          {
+            "node": "Build AI Parser Prompt",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "FATAL - Invalid Sender",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Report with exceljs": {
+      "main": [
+        [
+          {
+            "node": "Send an Email2",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code in JavaScript4": {
+      "main": [
+        [
+          {
+            "node": "Call 'STAGE 3 - Recommendation Engine'",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Call 'STAGE 3 - Recommendation Engine'": {
+      "main": [
+        [
+          {
+            "node": "Build Report with exceljs",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send an Email2": {
+      "main": [
+        [
+          {
+            "node": "Envelope Results",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Envelope Results": {
+      "main": [
+        [
+          {
+            "node": "Append rows to table",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Execute a SQL query": {
+      "main": [
+        [
+          {
+            "node": "Apply UPC Resolution",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Apply UPC Resolution": {
+      "main": [
+        [
+          {
+            "node": "Build SKU Verification Query",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build UPC Lookup Query": {
+      "main": [
+        [
+          {
+            "node": "Execute a SQL query",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build SKU Verification Query": {
+      "main": [
+        [
+          {
+            "node": "Query SKU Verification",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Query SKU Verification": {
+      "main": [
+        [
+          {
+            "node": "Apply SKU Verification",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Apply SKU Verification": {
+      "main": [
+        [
+          {
+            "node": "Any Manual Review Items?",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Stage 1 Complete — Output",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Combine Parsed Chunks": {
+      "main": [
+        [
+          {
+            "node": "Build UPC Lookup Query",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "timeSavedMode": "fixed",
+    "errorWorkflow": "Zn4tc7xH3g8hXHo4",
+    "callerPolicy": "workflowsFromSameOwner",
+    "availableInMCP": false
+  },
+  "meta": {
+    "templateCredsSetupCompleted": false
+  },
+  "tags": []
+}

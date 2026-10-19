@@ -1,0 +1,20 @@
+Inventory Report
+Store: Example Outfitters #12
+Run date: 2026-10-01
+
+MFG_SKU,Description,Qty On Hand,UPC
+A-100234-17,Alpha Trail Lantern 400,6,
+A-100235-17,Alpha Trail Lantern 400 Kit,10,
+A-2200XY-0,Alpha Camp Stove 2B,3,
+A-3AB65201,Alpha Cooler 45,30,
+111-2222-33,Alpha Lantern Mantle Pack,40,
+000912345678,Alpha Stove Fuel Canister 8oz,60,
+BR22B4,Bravo Daypack 22L,25,
+br22mb6,Bravo Daypack 22L Moss,4,
+BX1218CH,Bravo Hydration Bladder 3L,2,
+CH22L1811,Charlie Insulated Bottle 32oz,12,
+WB-40-STL,Charlie Insulated Bottle 40oz,0,012345600011
+771234567,Camp Chair Classic (old stock),5,
+A-100199-17,Alpha Trail Lantern 300,2,
+SMALL ITEMS,,,
+Total,,199,
